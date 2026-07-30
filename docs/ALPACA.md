@@ -168,7 +168,7 @@ Clear with `Greenhill:ClearFault` once an operator has looked at the dome.
 ## Testing
 
 ```bash
-pip install pytest falcon toml
+pip install -r requirements-dev.txt
 python -m pytest tests/ -q
 ```
 
@@ -176,10 +176,45 @@ No hardware, any OS. `tests/test_alpaca_dome.py` drives the real Falcon routing
 through a test client, and exercises the `ShutterStatus` collapse exhaustively
 over every combination of shell states.
 
+### ASCOM Conform Universal
+
+Both Conform suites pass against `simulate.py`:
+
+```
+alpacaprotocol   no errors, issues or information alerts
+conformance      no errors, warnings or issues; all members within target response times
+```
+
+`.github/workflows/conformance.yml` runs both on every push. It runs in CI rather
+than locally because ConformU ships as a Linux x64 binary and the runner is Linux
+x64. Two things worth knowing if you run it by hand:
+
+* it needs `libicu` or it aborts at startup;
+* `alpacaprotocol` writes only a log, no results file, even with `--resultsfile`.
+  Its verdict is the exit code, which is the error count.
+
+Conform found two real defects that our own tests could not, both in the HTTP
+layer inherited from the AlpycaDevice sample:
+
+1. **A duplicated `ClientID`/`ClientTransactionID` returned HTTP 500.** Falcon
+   collapses repeated keys into a list, `int(['1', ''])` raises `TypeError`, and
+   `shr.PreProcessRequest._pos_or_zero` only caught `ValueError`. Alpaca requires
+   400. Fixed in `shr.py`.
+2. **The server spoke HTTP/1.0 and closed every connection.** Every .NET ASCOM
+   client pools connections through `HttpClient`, so the *next* request on a
+   pooled socket was reset — appearing as "An error occurred while sending the
+   request" on whatever member happened to be next, which is why a different one
+   failed each run. `wsgiref`'s `WSGIRequestHandler` serves exactly one request
+   and never loops, and `wsgiref.handlers.BaseHandler` hardcodes
+   `http_version = '1.0'`, so `protocol_version` alone changes nothing. `app.py`
+   now supplies an HTTP/1.1 handler plus the request loop, and serves each
+   connection on its own thread. Confirmed by contrast with the reference ASCOM
+   Alpaca Simulators, which keeps the connection open.
+
 ## Not yet done
 
-* **ASCOM Conform Universal has not been run.** Everything here follows the spec
-  as read, but Conform is the arbiter and it should be run against
-  `simulate.py` before the server goes near the motors.
+* Conform has only been run against the **simulator**. It must be run against the
+  real dome before the server drives motors unattended: the simulator cannot
+  reproduce sensor faults or real travel timing.
 * No Windows service packaging yet (NSSM or similar).
 * `SlewToAltitude`, pending calibration.

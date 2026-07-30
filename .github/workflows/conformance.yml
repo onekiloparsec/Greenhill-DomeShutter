@@ -1,0 +1,116 @@
+name: ascom-conformance
+
+# Runs ASCOM Conform Universal against the dome server backed by the simulated
+# K8055 (device/simulate.py). Conform is the arbiter of whether this driver is a
+# well-behaved Alpaca device: it checks the response envelope, ClientID and
+# ClientTransactionID handling, which optional members must raise
+# NotImplementedException, and that Slewing behaves across shutter movement.
+# None of that is checkable from our own test suite, which only asserts what we
+# already believe.
+#
+# It runs here rather than on a developer machine because ConformU ships as a
+# Linux x64 binary and the runner is Linux x64 -- no emulation, no local install.
+#
+# Not a substitute for running Conform against the REAL dome before it drives
+# motors unattended: the simulator cannot reproduce sensor faults or timing.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Pinned so a new ConformU release cannot turn a green build red without a
+  # deliberate bump. Check https://github.com/ASCOMInitiative/ConformU/releases
+  CONFORMU_VERSION: v4.4.0
+
+jobs:
+  conform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install server dependencies
+        run: pip install falcon toml
+
+      - name: Download Conform Universal
+        run: |
+          curl -sSfL -o /tmp/conformu.tar.xz \
+            "https://github.com/ASCOMInitiative/ConformU/releases/download/${CONFORMU_VERSION}/conformu.linux-x64.tar.xz"
+          mkdir -p /tmp/conformu
+          tar -xJf /tmp/conformu.tar.xz -C /tmp/conformu
+          chmod +x /tmp/conformu/conformu
+          # ConformU is .NET and aborts at startup without ICU. Present on the
+          # GitHub runner image today, installed explicitly so an image change
+          # cannot break this silently.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libicu-dev
+          /tmp/conformu/conformu --version
+
+      - name: Start the dome server against the simulated board
+        working-directory: device
+        run: |
+          nohup python simulate.py > /tmp/dome-server.log 2>&1 &
+          echo $! > /tmp/dome-server.pid
+          for _ in $(seq 1 60); do
+            if curl -sf -m 1 "http://127.0.0.1:11111/api/v1/dome/0/name?ClientID=1&ClientTransactionID=1" >/dev/null; then
+              echo "Dome server is up."; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "::error::Dome server did not start."; cat /tmp/dome-server.log; exit 1
+
+      # ConformU's exit code is the error count, so each of these steps gates the
+      # build on its own. The evaluate step below then names the failing members
+      # in the log rather than leaving them in an uploaded artifact.
+      - name: Alpaca protocol conformance
+        run: |
+          mkdir -p /tmp/results
+          # This command writes only a log, no results file, so its verdict is
+          # the exit code. Print the summary either way.
+          set +e
+          /tmp/conformu/conformu alpacaprotocol \
+            "http://127.0.0.1:11111/api/v1/dome/0" \
+            --logfilename /tmp/results/alpacaprotocol.log
+          status=$?
+          grep -E 'Congratulations|Found .* error|ERROR' /tmp/results/alpacaprotocol.log || true
+          exit $status
+
+      - name: ASCOM Dome interface conformance
+        run: |
+          mkdir -p /tmp/results
+          set +e
+          /tmp/conformu/conformu conformance \
+            "http://127.0.0.1:11111/api/v1/dome/0" \
+            --logfilename /tmp/results/conformance.log \
+            --resultsfile /tmp/results/conformance.json
+          status=$?
+          grep -E 'Congratulations|Found .* error' /tmp/results/conformance.log || true
+          exit $status
+
+      - name: Evaluate results
+        if: always()
+        run: python .github/scripts/check_conformance.py /tmp/results
+
+      - name: Stop the dome server
+        if: always()
+        run: |
+          kill "$(cat /tmp/dome-server.pid)" 2>/dev/null || true
+          sleep 2
+          echo '--- dome server log (tail) ---'
+          tail -50 /tmp/dome-server.log || true
+
+      - name: Upload Conform logs and results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-results
+          path: |
+            /tmp/results/
+            /tmp/dome-server.log
+          if-no-files-found: warn

@@ -32,3 +32,29 @@ jobs:
       - run: pip install pytest falcon toml
       - name: Dome control and Alpaca conformance tests
         run: python -m pytest tests/ -q
+
+  generated-ui:
+    # ui_dome.py is generated from Dome.ui, but the progress-bar stylesheets had
+    # been hand-added to the generated file and were missing from the .ui source,
+    # so anyone running pyside6-uic would have silently deleted them. This job
+    # makes that class of divergence a build failure instead of a surprise.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Version pinned in requirements-dev.txt: uic stamps its own version into
+      # the output and formats it slightly differently between releases.
+      - run: pip install "$(grep -i '^PySide6==' requirements-dev.txt)"
+      - name: Check ui_dome.py matches Dome.ui
+        run: |
+          pyside6-uic Dome.ui -o /tmp/ui_dome.regenerated.py
+          if ! diff -u ui_dome.py /tmp/ui_dome.regenerated.py; then
+            echo
+            echo "::error file=ui_dome.py::ui_dome.py does not match Dome.ui."
+            echo "Edit Dome.ui in Qt Designer (never ui_dome.py), then run:"
+            echo "    pyside6-uic Dome.ui -o ui_dome.py"
+            echo "and commit both files together."
+            exit 1
+          fi
