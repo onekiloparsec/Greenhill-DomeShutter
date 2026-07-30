@@ -63,10 +63,27 @@ class Dome_Control:
     _live_instances = 0
     _instances_lock = threading.Lock()
 
-    def __init__(self):
+    # Physical facts about this dome, previously buried in the RDP watchdog:
+    # the telescope parks on the WEST side, so west closes first; and the two
+    # motors are staggered to keep them off the same switch inrush.
+    MOTOR_STAGGER = 1.0  # s between starting the two shells
+
+    def __init__(self, calibration=None):
+        """
+        :param calibration: optional dict overriding the analogue travel limits,
+            e.g. {'east_closed': 4, 'east_open': 231, 'west_closed': 2,
+            'west_open': 228}. The defaults below are the original author's
+            guesses, and a bench logic board will not read the same as the dome,
+            so real deployments must supply measured values.
+        """
         self.velleman = _Velleman()
         self.e_state = 'stopped'
         self.w_state = 'stopped'
+        # Latched faults. A shell that failed to open (the shared reed switch
+        # read closed while it was moving) must not be silently reported as
+        # merely 'stopped': Alpaca has to surface it as shutterError.
+        self.e_fault = None
+        self.w_fault = None
         self._lock = threading.RLock()
         # output ports for opening/closing
         self.eosw = 6  # east open channel
@@ -89,8 +106,22 @@ class Dome_Control:
         self.tolerance = 2
         self.east_position, self.west_position = self._read_shutter_positions()
         self.last_east, self.last_west = self.east_position, self.west_position
-        self.east_closed_position, self.west_closed_position = 0, 0  # might need to tweak based on real data
-        self.east_open_position, self.west_open_position = 235, 235  # tweak based on real data
+        # UNCALIBRATED DEFAULTS -- the original author's guesses. A closed
+        # reading above the real value stalls the motor into the hard stop on
+        # every close; one below it stops the shell while still ajar, with the
+        # reed unmade and no fault reported. Override via `calibration`.
+        self.east_closed_position, self.west_closed_position = 0, 0
+        self.east_open_position, self.west_open_position = 235, 235
+        if calibration:
+            self.east_closed_position = calibration.get('east_closed', self.east_closed_position)
+            self.east_open_position = calibration.get('east_open', self.east_open_position)
+            self.west_closed_position = calibration.get('west_closed', self.west_closed_position)
+            self.west_open_position = calibration.get('west_open', self.west_open_position)
+            self.tolerance = calibration.get('tolerance', self.tolerance)
+        for name, closed, opened in (('east', self.east_closed_position, self.east_open_position),
+                                     ('west', self.west_closed_position, self.west_open_position)):
+            if opened <= closed:
+                raise ValueError(f"{name} calibration invalid: open ({opened}) must exceed closed ({closed})")
         
         self.dir_delay = 0.750  # s delay between switching directions
         # shutdown plumbing: the monitor thread must be stoppable, and the
@@ -157,6 +188,9 @@ class Dome_Control:
         """
         # stop the motor if the shutter is in the opposite state
         with self._lock:
+            if self.e_fault:
+                print(f"East shutter has a latched fault, refusing to open: {self.e_fault}")
+                return
             rev = self.e_state == 'closing'
             if gen is None:
                 gen = self._cmd_gen
@@ -262,6 +296,9 @@ class Dome_Control:
         """
         # stop the motor if the shutter is in the opposite state
         with self._lock:
+            if self.w_fault:
+                print(f"West shutter has a latched fault, refusing to open: {self.w_fault}")
+                return
             rev = self.w_state == 'closing'
             if gen is None:
                 gen = self._cmd_gen
@@ -365,6 +402,127 @@ class Dome_Control:
         if not math.isfinite(fraction):
             raise ValueError(f"Shutter setpoint must be a finite percentage, got {percentage!r}")
         return int(round(max(0.0, min(1.0, fraction)) * (open_position - closed_position) + closed_position))
+
+    # ------------------------------------------------------------------ #
+    # Whole-dome operations                                              #
+    # ------------------------------------------------------------------ #
+
+    def is_moving(self):
+        """True if either shell is under power."""
+        with self._lock:
+            return self.e_state != 'stopped' or self.w_state != 'stopped'
+
+    def switches(self):
+        """Current limit/reed switch states."""
+        with self._lock:
+            return self._read_shutter_switches()
+
+    def target_counts(self, shell, percentage):
+        """Raw analogue setpoint a given percentage open would resolve to."""
+        if shell == 'east':
+            return self._convert_east_set(percentage)
+        if shell == 'west':
+            return self._convert_west_set(percentage)
+        raise ValueError(f"unknown shell {shell!r}")
+
+    def snapshot(self):
+        """
+        A single consistent view of both shells, taken under one lock.
+
+        Callers that need several related values (a UI frame, an Alpaca status
+        response) must use this rather than reading the attributes one at a
+        time, or they can observe a half-updated state where, say, the state
+        says 'stopped' but the position is from before the stop.
+        """
+        with self._lock:
+            span = self.east_open_position - self.east_closed_position
+            return {
+                'east': {
+                    'position': self.east_position,
+                    'percent': self._to_percent(self.east_position,
+                                                self.east_closed_position,
+                                                self.east_open_position),
+                    'state': self.e_state,
+                    'target': self.east_target,
+                    'fault': self.e_fault,
+                },
+                'west': {
+                    'position': self.west_position,
+                    'percent': self._to_percent(self.west_position,
+                                                self.west_closed_position,
+                                                self.west_open_position),
+                    'state': self.w_state,
+                    'target': self.west_target,
+                    'fault': self.w_fault,
+                },
+                'switches': self._read_shutter_switches(),
+                'moving': self.e_state != 'stopped' or self.w_state != 'stopped',
+                'tolerance_percent': (self.tolerance / float(span) * 100.0) if span > 0 else 0.0,
+            }
+
+    def faults(self):
+        """Latched faults as {'east': str|None, 'west': str|None}."""
+        with self._lock:
+            return {'east': self.e_fault, 'west': self.w_fault}
+
+    def clear_faults(self, shell='both'):
+        """Clear latched faults so motion is permitted again."""
+        with self._lock:
+            if shell in ('east', 'both'):
+                self.e_fault = None
+            if shell in ('west', 'both'):
+                self.w_fault = None
+
+    def _stagger(self, first, second):
+        """
+        Run two motor commands one after the other on a background thread, so
+        the caller returns immediately (Alpaca methods must not block) and the
+        two motors never start together.
+
+        The second command inherits the command generation captured before the
+        first, so any stop issued during the stagger gap cancels it instead of
+        starting a second motor after the operator asked everything to halt.
+        """
+        with self._lock:
+            if self._closed or self._stop_event.is_set():
+                return
+            gen = self._cmd_gen
+
+        def run():
+            try:
+                first()
+                if self._stop_event.wait(self.MOTOR_STAGGER):
+                    return  # shutting down
+                with self._lock:
+                    if self._cmd_gen != gen or self._closed:
+                        return  # a stop landed in the stagger gap
+                second()
+            except Exception as e:
+                print(f"Error during staggered dome operation: {e}")
+                self.stop_e()
+                self.stop_w()
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def open_both(self):
+        """Open both shells. Returns immediately; motion continues in background."""
+        self._stagger(self.open_w, self.open_e)
+
+    def close_both(self):
+        """
+        Close both shells. West goes first because the telescope parks on the
+        west side, so that shell must clear the OTA before the east one moves.
+        """
+        self._stagger(self.close_w, self.close_e)
+
+    def goto_both(self, percentage):
+        """Drive both shells to the same aperture, staggered."""
+        self._stagger(lambda: self.goto_w(percentage), lambda: self.goto_e(percentage))
+
+    def stop_both(self):
+        """Halt both shells immediately. This is the abort path: no threads."""
+        self.stop_e()
+        self.stop_w()
 
     def _to_percent(self, raw, closed_position, open_position):
         """
@@ -490,6 +648,9 @@ class Dome_Control:
                     print("Dome opening failed, stopping")
                     # Stop command issued as part of _drive_close_e below
                     self.east_target = None
+                    # latch it: the shell is left partially open with the reed
+                    # claiming closed, which Alpaca must report as shutterError
+                    self.e_fault = 'opening failed: all-closed switch made while opening'
                     # Dome is going to be in a partially open state now, and closing will not work as the switch says closed
                     self._drive_close_e()
                 # stop the motors if a drive to position has been issued and we are close to that position
@@ -539,6 +700,7 @@ class Dome_Control:
                     print("Dome opening failed, stopping")
                     # Stop command issued as part of _drive_close_w()
                     self.west_target = None
+                    self.w_fault = 'opening failed: all-closed switch made while opening'
                     self._drive_close_w()
                 elif _west_set_reached():
                     self.stop_w()
