@@ -1,0 +1,34 @@
+name: ci
+
+# A control program that drives dome motors must never reach this repository in
+# a state that cannot even be parsed: dome_UI.py sat broken in main with an
+# unclosed parenthesis, so nothing could run and no defect could be caught.
+#
+# Neither job needs Windows or a Velleman board. compileall only parses, and the
+# tests stub out win32com/pythoncom/pydub and the K8055 DLL.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Byte-compile every Python file
+        run: python -m compileall -q .
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pytest
+      - name: Dome control safety regressions
+        run: python -m pytest tests/ -q
