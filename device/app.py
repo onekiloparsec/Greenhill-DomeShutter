@@ -12,7 +12,9 @@ import socket
 import sys
 import traceback
 from enum import IntEnum
-from wsgiref.simple_server import WSGIRequestHandler, make_server
+from socketserver import ThreadingMixIn
+from wsgiref.simple_server import (ServerHandler, WSGIRequestHandler,
+                                   WSGIServer, make_server)
 
 import discovery
 import dome
@@ -53,8 +55,94 @@ def acquire_single_instance_lock() -> bool:
     return True
 
 
+class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+    """
+    A WSGI server that handles each connection on its own thread.
+
+    wsgiref's plain WSGIServer is single-threaded: one slow request blocks every
+    other client. That matters here because ASCOM clients poll several
+    properties at a time, and because a request arriving while the dome lock is
+    held (a shell reversing direction holds it briefly) would stall the whole
+    server rather than just that call.
+    """
+    daemon_threads = True   # never let a stuck request block process exit
+
+
+class Http11ServerHandler(ServerHandler):
+    """WSGI handler that writes an HTTP/1.1 status line.
+
+    wsgiref.handlers.BaseHandler hardcodes http_version = '1.0', and it -- not
+    WSGIRequestHandler.protocol_version -- is what writes the status line. So
+    setting protocol_version alone produces a server that negotiates keep-alive
+    at the socket layer while telling the client "HTTP/1.0", i.e. "I am closing
+    this connection".
+    """
+    http_version = '1.1'
+
+
 class LoggingWSGIRequestHandler(WSGIRequestHandler):
     """Subclass of WSGIRequestHandler allowing us to control WSGI server's logging"""
+
+    # Every ASCOM .NET client (Conform Universal included) pools connections
+    # through HttpClient. Served as HTTP/1.0 the connection closes after each
+    # response, and the client's next request on that pooled socket is reset --
+    # surfacing as "An error occurred while sending the request" on whichever
+    # member happened to be next, which is why it moved around between runs.
+    # Reproduced against the reference ASCOM simulator, which keeps the
+    # connection open and passes cleanly.
+    protocol_version = 'HTTP/1.1'
+
+    # Idle keep-alive connections hold a thread each, so drop them.
+    timeout = 60
+
+    def handle(self):
+        """Serve every request on this connection, rather than just the first.
+
+        wsgiref's WSGIRequestHandler.handle() serves exactly one request and
+        returns, so the connection always closes -- there is no keep-alive to be
+        had from it no matter what protocol_version says. This restores the
+        request loop that BaseHTTPRequestHandler.handle() normally provides.
+        """
+        self.close_connection = True
+        self.handle_one_request()
+        while not self.close_connection:
+            self.handle_one_request()
+
+    def handle_one_request(self):
+        """One request, dispatched through WSGI. Mirrors wsgiref's handle()."""
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+        except (TimeoutError, socket.timeout, ConnectionError, OSError):
+            self.close_connection = True
+            return
+
+        if not self.raw_requestline:          # client hung up
+            self.close_connection = True
+            return
+        if len(self.raw_requestline) > 65536:
+            self.requestline = ''
+            self.request_version = ''
+            self.command = ''
+            self.send_error(414)
+            self.close_connection = True
+            return
+        if not self.parse_request():          # an error code has been sent already
+            self.close_connection = True
+            return
+
+        handler = Http11ServerHandler(
+            self.rfile, self.wfile, self.get_stderr(), self.get_environ(),
+            multithread=True,
+        )
+        handler.request_handler = self        # backpointer for logging
+        try:
+            handler.run(self.server.get_app())
+        except (ConnectionError, OSError):
+            # client vanished mid-response; nothing to report, just stop
+            self.close_connection = True
+            return
+        # parse_request() has already set close_connection from the request's
+        # HTTP version and Connection header; honour it.
 
     def log_message(self, format: str, *args):
         # Requests are logged on the way in by shr.log_request, which keeps the
@@ -142,6 +230,7 @@ def main():
 
     try:
         with make_server(Config.ip_address, Config.port, falc_app,
+                         server_class=ThreadingWSGIServer,
                          handler_class=LoggingWSGIRequestHandler) as httpd:
             logger.info(f'==STARTUP== Greenhill dome server on '
                         f'{Config.ip_address}:{Config.port}. Time stamps are UTC.')

@@ -53,7 +53,17 @@ class SimulatedBoard:
 
     # ---- the DLL surface ----
     def OpenDevice(self, n):
-        if self._animate and self._thread is None:
+        # Reopening after a close must work: a client setting Connected false
+        # then true again is normal (ASCOM Conform does exactly that), and the
+        # real board reopens happily. An earlier version left the travel thread
+        # dead after a close, so the shells stopped moving for the rest of the
+        # process and every subsequent open silently timed out on stall
+        # detection -- the device looked broken when only the simulator was.
+        with self._lock:
+            self.closed = False
+            self._last_tick = time.monotonic()
+        self._stop.clear()
+        if self._animate and (self._thread is None or not self._thread.is_alive()):
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
         return 0
@@ -62,6 +72,9 @@ class SimulatedBoard:
         with self._lock:
             self.closed = True
         self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
 
     def SetDigitalChannel(self, ch):
         with self._lock:
