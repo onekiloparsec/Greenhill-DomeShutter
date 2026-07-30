@@ -4,9 +4,11 @@ Created on Mon May 18 09:39:38 2026
 
 @author: bemptage
 """
+import atexit
 import math
 import time
 from datetime import datetime, timedelta
+import signal
 import socket
 import select
 import subprocess
@@ -48,7 +50,19 @@ class _Velleman:
     def read_analogue(self, channel):
         return self.lib.ReadAnalogChannel(channel)
 
+    def close(self):
+        # Release the board. Callers must de-energise the outputs FIRST: closing
+        # the device does not clear the K8055 output latches.
+        self.lib.CloseDevice()
+
 class Dome_Control:
+    # The DLL is cached per process and every instance addresses board 0, so all
+    # Dome_Control objects share ONE device handle. Only the last one out may
+    # close it, or an early CloseDevice silently swallows another instance's
+    # de-energise calls.
+    _live_instances = 0
+    _instances_lock = threading.Lock()
+
     def __init__(self):
         self.velleman = _Velleman()
         self.e_state = 'stopped'
@@ -79,9 +93,36 @@ class Dome_Control:
         self.east_open_position, self.west_open_position = 235, 235  # tweak based on real data
         
         self.dir_delay = 0.750  # s delay between switching directions
+        # shutdown plumbing: the monitor thread must be stoppable, and the
+        # relays must be de-energised on ANY exit path
+        self._stop_event = threading.Event()
+        self._monitor_thread = None
+        self._shutdown_done = False
+        self._shutdown_owner = None
+        self._closed = False
+        # deliberately NOT self._lock: shutdown must not queue behind a motion
+        # section that may be sleeping for up to ~2.75 s
+        self._shutdown_lock = threading.Lock()
+        # Bumped by every stop. A motion that released the lock to sleep must
+        # re-check it before energising, otherwise a stop issued during that
+        # sleep is silently overridden by the motion that was already in flight.
+        self._cmd_gen = 0
+        with Dome_Control._instances_lock:
+            Dome_Control._live_instances += 1
         self.stop_e()  # ensure dome stopped on initialisation
         self.stop_w()
         self._monitor(0.1)  # 100ms polling
+        self._install_exit_hooks()
+
+    def _may_energise(self, gen):
+        """
+        Final barrier before any relay is energised. Must be called with the
+        lock held. Refuses if the controller is shutting down/closed, or if a
+        stop was issued after this command captured its generation.
+        """
+        if self._closed or self._stop_event.is_set():
+            return False
+        return gen is None or gen == self._cmd_gen
 
     def _set_state(self, shutter, state):
         """
@@ -104,30 +145,53 @@ class Dome_Control:
             if state.lower() != 'stopped':
                 self.last_west = self.west_position
 
-    def open_e(self):
+    def open_e(self, target=None, gen=None):
+        """
+        :param target: raw analogue setpoint to stop at, or None for a manual
+            open that runs until a limit switch or the stall timeout stops it.
+        :param gen: command generation captured by the caller before it released
+            the lock. If a stop was issued since, this motion is abandoned.
+
+        The target is armed in the same locked section that energises the relay,
+        so a setpoint can never outlive the motion it belongs to.
+        """
         # stop the motor if the shutter is in the opposite state
         with self._lock:
             rev = self.e_state == 'closing'
+            if gen is None:
+                gen = self._cmd_gen
         # Don't sleep during lock, so sleep outside lock
         if rev:
             self.stop_e()
+            with self._lock:
+                gen = self._cmd_gen  # our own stop bumped it; re-baseline
             time.sleep(self.dir_delay)
 
         with self._lock:
+            if not self._may_energise(gen):
+                return
+            self.east_target = target
             self._set_state('e', 'opening')
             # redundant clear for safety
             self.velleman.clear_output(self.ecsw)
             self.velleman.set_output(self.eosw)
-        
-    def close_e(self):
+
+    def close_e(self, target=None, gen=None):
         with self._lock:
             rev = self.e_state == 'opening'
+            if gen is None:
+                gen = self._cmd_gen
 
         if rev:
             self.stop_e()
+            with self._lock:
+                gen = self._cmd_gen
             time.sleep(self.dir_delay)  # pause before swapping directions
 
         with self._lock:
+            if not self._may_energise(gen):
+                return
+            self.east_target = target
             self._set_state('e', 'closing')
             self.velleman.clear_output(self.eosw)
             self.velleman.set_output(self.ecsw)
@@ -139,57 +203,99 @@ class Dome_Control:
         if self.e_state == 'opening':
             self.stop_e()
             time.sleep(self.dir_delay)
-        #start driving the dome closed
-        self.velleman.clear_output(self.eosw)
-        self.velleman.set_output(self.ecsw)
-        # TODO: replace with logic using dome position
-        time.sleep(2)  # let the dome close fully
-        self.stop_e()
+        with self._lock:
+            if not self._may_energise(None):
+                return  # shutting down: do not energise anything
+            #start driving the dome closed
+            self.velleman.clear_output(self.eosw)
+            self.velleman.set_output(self.ecsw)
+        try:
+            # TODO: replace with logic using dome position
+            # wait() not sleep(): a shutdown must not have to wait this out
+            self._stop_event.wait(2)  # let the dome close fully
+        finally:
+            # an exception here must never leave the close relay latched
+            self.stop_e()
 
     def stop_e(self):
         with self._lock:
             self.velleman.clear_output(self.eosw)
             self.velleman.clear_output(self.ecsw)
+            # a stopped shutter has no pending setpoint: leaving one armed would
+            # abort the next manual Open/Close on its very first poll
+            self.east_target = None
+            # invalidate any motion that is mid-flight in its direction delay
+            self._cmd_gen += 1
             self._set_state('e', 'stopped')
 
     def goto_e(self, setpoint):
         """
-        Moves the shutter to the setpoint position
+        Moves the shutter to the setpoint position, given as a percentage open.
         """
+        target = self._convert_east_set(setpoint)
         with self._lock:
-            self.east_target = self._convert_east_set(setpoint)
-            if self.east_position < self.east_target - self.tolerance:
+            gen = self._cmd_gen
+            if self.east_position < target - self.tolerance:
                 # open the dome to increase position. Do nothing if close to target (within tolerance value)
-                self.open_e()
-            elif self.east_position > self.east_target + self.tolerance:
-                self.close_e()
+                direction = 'open'
+            elif self.east_position > target + self.tolerance:
+                direction = 'close'
             else:
-                # do nothing if setpoint results in too small of a movement
-                return
+                # Already within tolerance of the setpoint. If the shell is
+                # moving, "go to where you already are" means STOP: leaving it
+                # running would drive it on to the limit switch.
+                direction = 'hold'
+        # started outside the lock: open_e/close_e may sleep dir_delay to reverse,
+        # and holding the lock across that sleep would suspend the other shell's
+        # supervision and block the Stop button for the duration
+        if direction == 'open':
+            self.open_e(target=target, gen=gen)
+        elif direction == 'close':
+            self.close_e(target=target, gen=gen)
+        else:
+            self.stop_e()
     
-    def open_w(self):
+    def open_w(self, target=None, gen=None):
+        """
+        :param target: raw analogue setpoint to stop at, or None for a manual open.
+        :param gen: command generation captured before the caller released the lock.
+        """
         # stop the motor if the shutter is in the opposite state
         with self._lock:
             rev = self.w_state == 'closing'
+            if gen is None:
+                gen = self._cmd_gen
 
         if rev:
             self.stop_w()
+            with self._lock:
+                gen = self._cmd_gen  # our own stop bumped it; re-baseline
             time.sleep(self.dir_delay)
 
         with self._lock:
+            if not self._may_energise(gen):
+                return
+            self.west_target = target
             self._set_state('w', 'opening')
             self.velleman.clear_output(self.wcsw)
             self.velleman.set_output(self.wosw)
-        
-    def close_w(self):
+
+    def close_w(self, target=None, gen=None):
         with self._lock:
             rev = self.w_state == 'opening'
+            if gen is None:
+                gen = self._cmd_gen
 
         if rev:
             self.stop_w()
+            with self._lock:
+                gen = self._cmd_gen
             time.sleep(self.dir_delay)
 
         with self._lock:
+            if not self._may_energise(gen):
+                return
+            self.west_target = target
             self._set_state('w', 'closing')
             self.velleman.clear_output(self.wosw)
             self.velleman.set_output(self.wcsw)
@@ -201,31 +307,46 @@ class Dome_Control:
         if self.w_state == 'opening':
             self.stop_w()
             time.sleep(self.dir_delay)
-        #start driving the dome closed
-        self.velleman.clear_output(self.wosw)
-        self.velleman.set_output(self.wcsw)
-        # TODO: replace with logic using dome position
-        time.sleep(2)  # let the dome close fully
-        self.stop_w()
+        with self._lock:
+            if not self._may_energise(None):
+                return  # shutting down: do not energise anything
+            #start driving the dome closed
+            self.velleman.clear_output(self.wosw)
+            self.velleman.set_output(self.wcsw)
+        try:
+            # TODO: replace with logic using dome position
+            self._stop_event.wait(2)  # let the dome close fully
+        finally:
+            self.stop_w()
 
     def stop_w(self):
         with self._lock:
             self.velleman.clear_output(self.wosw)
             self.velleman.clear_output(self.wcsw)
+            self.west_target = None
+            self._cmd_gen += 1
             self._set_state('w', 'stopped')
 
     def goto_w(self, setpoint):
         """
-            Moves the west shutter to the setpoint position
+            Moves the west shutter to the setpoint position, as a percentage open.
         """
+        target = self._convert_west_set(setpoint)
         with self._lock:
-            self.west_target = self._convert_west_set(setpoint)
-            if self.west_position < self.west_target - self.tolerance:
-                self.open_w()
-            elif self.west_position > self.west_target + self.tolerance:
-                self.close_w()
+            gen = self._cmd_gen
+            if self.west_position < target - self.tolerance:
+                direction = 'open'
+            elif self.west_position > target + self.tolerance:
+                direction = 'close'
             else:
-                return
+                # already there: if it is moving, arrest it (see goto_e)
+                direction = 'hold'
+        if direction == 'open':
+            self.open_w(target=target, gen=gen)
+        elif direction == 'close':
+            self.close_w(target=target, gen=gen)
+        else:
+            self.stop_w()
 
     def _to_raw(self, percentage, closed_position, open_position):
         """
@@ -424,14 +545,116 @@ class Dome_Control:
     def _monitor(self, pollrate):
         # polling loop to return current dome status
         def loop():
-            while True:
+            while not self._stop_event.is_set():
                 try:
                     self._update_status()
                 except Exception:
                     print("Error on updater")
-                time.sleep(pollrate)
-        threading.Thread(target=loop, daemon=True).start()
-    # TODO set up safe shutdown of thread on close
+                # wait() rather than sleep() so shutdown is not delayed by a
+                # full poll interval
+                self._stop_event.wait(pollrate)
+        self._monitor_thread = threading.Thread(target=loop, daemon=True)
+        self._monitor_thread.start()
+
+    def _install_exit_hooks(self):
+        """
+        The K8055 holds its output latches in hardware: if this process dies
+        while a motor is running, the relay stays energised and the shutter
+        keeps driving with nothing supervising it. Cover every exit path we can.
+        """
+        atexit.register(self.shutdown)
+        # signal handlers can only be installed from the main thread
+        if threading.current_thread() is not threading.main_thread():
+            return
+        for signame in ('SIGINT', 'SIGTERM'):
+            sig = getattr(signal, signame, None)
+            if sig is None:
+                continue
+            try:
+                previous = signal.getsignal(sig)
+                if previous == signal.SIG_IGN:
+                    continue  # the app deliberately ignores this signal; respect it
+
+                def handler(signum, frame, _previous=previous):
+                    self.shutdown()
+                    if callable(_previous):
+                        _previous(signum, frame)
+                    # SIG_DFL, None (handler installed from C) or anything else:
+                    # the board is closed and the monitor is gone, so carrying on
+                    # would leave a live-looking UI driving a dead controller
+                    sys.exit(128 + signum)
+
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass  # not supported on this platform; atexit still applies
+
+    def shutdown(self):
+        """
+        Stop the monitor thread, de-energise every motor channel and release the
+        board. Idempotent, and safe to call from atexit, a signal handler, or the
+        UI's close event.
+        """
+        me = threading.current_thread()
+        with self._shutdown_lock:
+            if self._shutdown_done or self._shutdown_owner is me:
+                return  # already done, or re-entered by our own signal handler
+            self._shutdown_owner = me
+        try:
+            # Refuse all further motion FIRST: a motion sleeping through its
+            # direction delay must not wake up and energise a relay behind us.
+            self._closed = True
+            self._stop_event.set()
+
+            thread = self._monitor_thread
+            if thread is not None and thread is not me:
+                # bounded: the monitor can be mid-_drive_close_* holding the lock
+                thread.join(timeout=5.0)
+                if thread.is_alive():
+                    print("Monitor thread did not stop; clearing outputs anyway")
+
+            self._force_de_energise()
+
+            # only the last controller standing may release the shared board
+            with Dome_Control._instances_lock:
+                Dome_Control._live_instances -= 1
+                last = Dome_Control._live_instances <= 0
+            if last:
+                try:
+                    self.velleman.close()
+                except Exception as e:
+                    print(f"Error closing Velleman device: {e}")
+        finally:
+            with self._shutdown_lock:
+                self._shutdown_owner = None
+        # Marked complete only now: if the sequence above was interrupted (a
+        # second Ctrl-C landing in the join), a later atexit call must retry
+        # rather than return to an exit with the relays still hot.
+        with self._shutdown_lock:
+            self._shutdown_done = True
+
+    def _force_de_energise(self):
+        """
+        Clear all four motor channels. De-energising is the one operation that
+        must never be gated on a lock: if the monitor thread is wedged inside a
+        hung DLL call while holding self._lock, waiting for it would leave the
+        relays latched -- exactly the failure this whole path exists to prevent.
+        """
+        acquired = self._lock.acquire(timeout=1.0)
+        if not acquired:
+            print("Could not take the dome lock; clearing outputs unsynchronised")
+        try:
+            for channel in (self.eosw, self.ecsw, self.wosw, self.wcsw):
+                try:
+                    self.velleman.clear_output(channel)
+                except Exception as e:
+                    print(f"Error clearing channel {channel}: {e}")
+            self.e_state = 'stopped'
+            self.w_state = 'stopped'
+            self.east_target = None
+            self.west_target = None
+        finally:
+            if acquired:
+                self._lock.release()
 
 class Telescope:
     ASCOM_DRIVER = "DDR_ASCOM.Telescope"

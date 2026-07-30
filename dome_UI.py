@@ -137,8 +137,16 @@ class DomeWindow(QMainWindow):
         print("Toggling RDP Monitor")
 
     def closeEvent(self, event):
-        self.dome_thread.quit()
-        self.dome_thread.wait()
+        try:
+            self.dome_thread.quit()
+            # bounded: if the worker is stuck in a hung K8055 call, an untimed
+            # wait() would gate the de-energise on the very thing that failed
+            if not self.dome_thread.wait(3000):
+                print("Dome worker did not stop in 3 s; shutting down anyway")
+        finally:
+            # the K8055 latches its outputs in hardware: without this, closing
+            # the window leaves a running motor energised and unsupervised
+            self.dome.shutdown()
         super().closeEvent(event)
 
 if __name__ == "__main__":
