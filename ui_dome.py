@@ -3,7 +3,7 @@
 ################################################################################
 ## Form generated from reading UI file 'Dome.ui'
 ##
-## Created by: Qt User Interface Compiler version 6.11.1
+## Created by: Qt User Interface Compiler version 6.10.2
 ##
 ## WARNING! All changes made in this file will be lost when recompiling UI file!
 ################################################################################
@@ -102,16 +102,14 @@ class Ui_MainWindow(object):
         self.west_progress = QProgressBar(self.centralwidget)
         self.west_progress.setObjectName(u"west_progress")
         self.west_progress.setGeometry(QRect(160, 30, 30, 171))
-        self.west_progress.setStyleSheet("""
-                    QProgressBar {
-                        border: 1px solid gray;
-                        text-align: center;
-                        font-size: 7pt;
-                    }
-                    QProgressBar::chunk {
-                        background-color: #3c5a32;
-                    }
-                    """)
+        self.west_progress.setStyleSheet(u"QProgressBar {\n"
+"    border: 1px solid gray;\n"
+"    text-align: center;\n"
+"    font-size: 7pt;\n"
+"}\n"
+"QProgressBar::chunk {\n"
+"    background-color: #3c5a32;\n"
+"}")
         sizePolicy = QSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Expanding)
         sizePolicy.setHorizontalStretch(100)
         sizePolicy.setVerticalStretch(0)
@@ -123,16 +121,14 @@ class Ui_MainWindow(object):
         self.east_progress = QProgressBar(self.centralwidget)
         self.east_progress.setObjectName(u"east_progress")
         self.east_progress.setGeometry(QRect(410, 30, 30, 171))
-        self.east_progress.setStyleSheet("""
-                            QProgressBar {
-                                border: 1px solid gray;
-                                text-align: center;
-                                font-size: 7pt;
-                            }
-                            QProgressBar::chunk {
-                                background-color: #3c5a32;
-                            }
-                            """)
+        self.east_progress.setStyleSheet(u"QProgressBar {\n"
+"    border: 1px solid gray;\n"
+"    text-align: center;\n"
+"    font-size: 7pt;\n"
+"}\n"
+"QProgressBar::chunk {\n"
+"    background-color: #3c5a32;\n"
+"}")
         sizePolicy1 = QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         sizePolicy1.setHorizontalStretch(0)
         sizePolicy1.setVerticalStretch(0)
