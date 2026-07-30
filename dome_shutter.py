@@ -4,6 +4,7 @@ Created on Mon May 18 09:39:38 2026
 
 @author: bemptage
 """
+import math
 import time
 from datetime import datetime, timedelta
 import socket
@@ -226,19 +227,35 @@ class Dome_Control:
             else:
                 return
 
+    def _to_raw(self, percentage, closed_position, open_position):
+        """
+        Converts a 0-100 percentage-open value into a raw analogue setpoint.
+
+        The percentage is a PERCENT, not a 0-1 fraction: 0 is fully closed and
+        100 is fully open. The result is clamped to the calibrated travel so a
+        bad input can never ask for a position the shutter cannot reach (an
+        unreachable target never satisfies the stop test, which turns every
+        goto into a drive-to-the-limit-switch).
+
+        Rejects non-finite input rather than clamping it: min(1.0, nan) is 1.0
+        in Python, so a NaN setpoint would silently clamp to FULLY OPEN.
+        """
+        fraction = float(percentage) / 100.0
+        if not math.isfinite(fraction):
+            raise ValueError(f"Shutter setpoint must be a finite percentage, got {percentage!r}")
+        return int(round(max(0.0, min(1.0, fraction)) * (open_position - closed_position) + closed_position))
+
     def _convert_west_set(self, percentage):
         """
         Converts a percentage value to a position value for the west shutter
         """
-        val = int(percentage * (self.west_open_position - self.west_closed_position) + self.west_closed_position)
-        return val
+        return self._to_raw(percentage, self.west_closed_position, self.west_open_position)
 
     def _convert_east_set(self, percentage):
         """
-        Converts a percentage value to a position value for the west shutter
+        Converts a percentage value to a position value for the east shutter
         """
-        val = int(percentage * (self.east_open_position - self.east_closed_position) + self.east_closed_position)
-        return val
+        return self._to_raw(percentage, self.east_closed_position, self.east_open_position)
     
     def _read_shutter_switches(self):
         """
