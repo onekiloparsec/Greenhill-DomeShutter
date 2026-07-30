@@ -40,7 +40,7 @@ class DomeWorker(QObject):
 
     @Slot(int)
     def west_goto(self, value):
-        self.west_status.emit(f"WEST SETPOINT {value}"
+        self.west_status.emit(f"WEST SETPOINT {value}")
         value = 100 - value  # backwards state - 100 is closed, 0 is open
         self.dome.goto_w(value)
 
