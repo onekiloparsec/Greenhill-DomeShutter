@@ -1,0 +1,46 @@
+title = "Greenhill Clamshell Dome (Alpaca)"
+
+[network]
+ip_address = ''             # Any address
+port = 11111                # Conventional Alpaca device port
+
+[server]
+location = 'Greenhill Observatory, Tasmania'
+verbose_driver_exceptions = true
+
+[device]
+sync_write_connected = true     # True to emulate sync Connected = true (for Conform)
+
+# ---------------------------------------------------------------------------
+# CALIBRATION -- raw K8055 analogue readings (0-255) at each shell's stops.
+#
+# THE VALUES BELOW ARE NOT MEASURED. They are the guesses inherited from
+# dome_shutter.py, kept only so the server can start on a bench.
+#
+# Leave `calibrated = false` until someone has recorded, per shell:
+#   * the reading with the shell against its mechanical CLOSED stop
+#   * the reading with the shell against its OPEN limit switch
+#   * the at-rest jitter over ~60 s, which sets a sane `tolerance`
+#
+# Why it matters: a closed value above the truth means the position stop is
+# never reached, so every close terminates by stalling into the hard stop. A
+# closed value below the truth stops the shell while it is still ajar, with the
+# reed switch unmade and no fault reported -- software says shut, the dome is
+# open a crack. A wrong open value makes every intermediate aperture wrong.
+#
+# A bench logic board will NOT read the same as the dome. Keep one config per
+# installation rather than editing this one back and forth.
+# ---------------------------------------------------------------------------
+[calibration]
+calibrated = false          # set true ONLY once the values below are measured
+east_closed = 0
+east_open = 235
+west_closed = 0
+west_open = 235
+tolerance = 2               # counts; must exceed the analogue noise floor
+
+[logging]
+log_level = 'INFO'
+log_to_stdout = true
+max_size_mb = 5
+num_keep_logs = 10
