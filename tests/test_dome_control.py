@@ -1,72 +1,18 @@
 """Safety regression tests for Dome_Control.
 
-These run with NO Velleman board and on any OS: the Windows-only modules and the
-K8055 DLL are replaced with stubs before dome_shutter is imported. A fake board
-models the one property that matters -- the K8055 holds its output latches until
-something explicitly clears them.
+Runs with NO Velleman board and on any OS: see tests/conftest.py for the stubs.
 
 Every test here corresponds to a defect that was live in production. Do not
 delete one without understanding which failure it is holding shut.
 """
-import sys
-import os
-import types
-import time
 import threading
+import time
 
 import pytest
 
-# --- stub the Windows-only surface before importing dome_shutter -----------
-for _name in ("win32com", "win32com.client", "pythoncom", "pydub", "pydub.playback"):
-    _m = types.ModuleType(_name)
-    _m.Dispatch = lambda *a, **k: None
-    _m.CoInitialize = lambda *a, **k: None
-    _m.CoUninitialize = lambda *a, **k: None
-    _m.play = lambda *a, **k: None
-    sys.modules.setdefault(_name, _m)
-sys.modules["win32com"].client = sys.modules["win32com.client"]
+import dome_shutter
+from conftest import BOARD
 
-import ctypes
-
-
-class FakeBoard:
-    """Models a K8055: outputs latch until cleared."""
-
-    def __init__(self):
-        self.outputs = set()
-        self.closed = False
-        self.analog = {1: 0, 2: 0}          # 1 = west, 2 = east
-        # limit switches are active-low ("0 on fully open"), reed is active-high.
-        # 0b011 == mid-travel: neither limit reached, reed unmade.
-        self.digital = 0b011
-        self.hang = threading.Event()        # set to simulate a wedged USB call
-
-    def OpenDevice(self, n):
-        return 0
-
-    def CloseDevice(self):
-        self.closed = True
-
-    def SetDigitalChannel(self, ch):
-        self.outputs.add(ch)
-
-    def ClearDigitalChannel(self, ch):
-        self.outputs.discard(ch)
-
-    def ReadAllDigital(self):
-        while self.hang.is_set():
-            time.sleep(0.01)
-        return self.digital
-
-    def ReadAnalogChannel(self, ch):
-        return self.analog[ch]
-
-
-BOARD = FakeBoard()
-ctypes.WinDLL = lambda path: BOARD
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import dome_shutter  # noqa: E402
 
 
 @pytest.fixture

@@ -13,3 +13,8 @@ stop_monitor.flag
 /.idea
 stop_monitor.flag
 Dome Shutter.py
+
+# Alpaca device server runtime artifacts
+alpyca.log*
+device/alpyca.log*
+.pytest_cache/

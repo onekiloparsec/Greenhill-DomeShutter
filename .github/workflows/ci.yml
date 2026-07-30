@@ -5,7 +5,7 @@ name: ci
 # unclosed parenthesis, so nothing could run and no defect could be caught.
 #
 # Neither job needs Windows or a Velleman board. compileall only parses, and the
-# tests stub out win32com/pythoncom/pydub and the K8055 DLL.
+# tests stub the Windows-only imports and run against device/board_sim.py.
 
 on:
   push:
@@ -29,6 +29,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install pytest
-      - name: Dome control safety regressions
+      - run: pip install pytest falcon toml
+      - name: Dome control and Alpaca conformance tests
         run: python -m pytest tests/ -q
