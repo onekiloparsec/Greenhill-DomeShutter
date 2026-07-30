@@ -366,6 +366,29 @@ class Dome_Control:
             raise ValueError(f"Shutter setpoint must be a finite percentage, got {percentage!r}")
         return int(round(max(0.0, min(1.0, fraction)) * (open_position - closed_position) + closed_position))
 
+    def _to_percent(self, raw, closed_position, open_position):
+        """
+        Inverse of _to_raw: a raw analogue reading as a percentage open.
+        Clamped, because the reading can sit slightly outside the calibrated
+        travel through sensor noise or an imperfect calibration.
+        """
+        span = open_position - closed_position
+        if span == 0:
+            return 0.0
+        return max(0.0, min(100.0, (raw - closed_position) / float(span) * 100.0))
+
+    def east_percent_open(self):
+        """East shutter aperture, 0 = closed, 100 = fully open."""
+        with self._lock:
+            return self._to_percent(self.east_position, self.east_closed_position,
+                                    self.east_open_position)
+
+    def west_percent_open(self):
+        """West shutter aperture, 0 = closed, 100 = fully open."""
+        with self._lock:
+            return self._to_percent(self.west_position, self.west_closed_position,
+                                    self.west_open_position)
+
     def _convert_west_set(self, percentage):
         """
         Converts a percentage value to a position value for the west shutter

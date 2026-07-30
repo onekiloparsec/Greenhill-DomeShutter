@@ -40,8 +40,8 @@ class DomeWorker(QObject):
 
     @Slot(int)
     def west_goto(self, value):
-        self.west_status.emit(f"WEST SETPOINT {value}")
-        value = 100 - value  # backwards state - 100 is closed, 0 is open
+        # one convention everywhere: 0 = closed, 100 = fully open
+        self.west_status.emit(f"WEST SETPOINT {value}% open")
         self.dome.goto_w(value)
 
     @Slot()
@@ -61,14 +61,18 @@ class DomeWorker(QObject):
 
     @Slot(int)
     def east_goto(self, value):
-        self.east_status.emit(f"EAST SETPOINT {value}")
-        value = 100 - value  # backwards state - 100 is closed, 0 is open
+        self.east_status.emit(f"EAST SETPOINT {value}% open")
         self.dome.goto_e(value)
 
     @Slot()
     def dome_position(self):
-        self.east_position.emit(int(self.dome.last_east))
-        self.west_position.emit(int(self.dome.last_west))
+        # percent open, matching the setpoint sliders. Previously this emitted
+        # raw analogue counts (0-235) into a 0-100 progress bar, so the display
+        # pegged at full for anything past ~43% open. Also reads the live
+        # position rather than last_east/last_west, which track the travel
+        # extreme for stall detection and are not a position readout.
+        self.east_position.emit(int(round(self.dome.east_percent_open())))
+        self.west_position.emit(int(round(self.dome.west_percent_open())))
 
 
 

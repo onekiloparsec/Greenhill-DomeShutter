@@ -129,6 +129,33 @@ def test_non_finite_setpoint_is_rejected(quiet_dome, bad):
         quiet_dome._convert_east_set(bad)
 
 
+# --- one convention: 0 = closed, 100 = fully open, setpoint and readback ---
+
+@pytest.mark.parametrize("percent", [0, 25, 50, 75, 100])
+def test_percent_round_trips_through_raw_counts(quiet_dome, percent):
+    raw = quiet_dome._convert_east_set(percent)
+    place_east(quiet_dome, raw)
+    assert round(quiet_dome.east_percent_open()) == percent
+
+
+def test_percent_open_is_clamped_outside_calibrated_travel(quiet_dome):
+    place_east(quiet_dome, -5)              # sensor noise below the closed stop
+    assert quiet_dome.east_percent_open() == 0.0
+    place_east(quiet_dome, 260)             # or above the open stop
+    assert quiet_dome.east_percent_open() == 100.0
+
+
+def test_a_higher_setpoint_opens_and_a_lower_one_closes(quiet_dome):
+    # the setpoint is percent OPEN, so a larger number must drive towards open.
+    # An inversion anywhere in the chain shows up here.
+    place_east(quiet_dome, quiet_dome._convert_east_set(50))
+    quiet_dome.goto_e(90)
+    assert quiet_dome.e_state == 'opening'
+    quiet_dome.stop_e()
+    quiet_dome.goto_e(10)
+    assert quiet_dome.e_state == 'closing'
+
+
 # --- stale setpoints ------------------------------------------------------
 
 def test_stop_clears_pending_setpoint(quiet_dome):
