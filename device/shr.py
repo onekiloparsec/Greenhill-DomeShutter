@@ -118,13 +118,30 @@ def to_bool(str: str) -> bool:
 # missing. In any case, raise a 400 BAD REQUEST. Optional
 # caseless (mostly for the ClientID and ClientTransactionID)
 # ---------------------------------------------------------
+def _single_value(name: str, value):
+    """Reject a parameter that the client sent more than once.
+
+    LOCAL FIX (not upstream AlpycaDevice). Falcon collapses repeated query or
+    form keys into a *list*, which then flowed straight into int() in
+    PreProcessRequest._pos_or_zero. int(['1', '']) raises TypeError, which that
+    method does not catch, so a duplicated ClientTransactionID escaped as an
+    HTTP 500 where Alpaca requires a 400. Found by Conform Universal's
+    alpacaprotocol check ("ClientTransactionID is empty").
+    """
+    if isinstance(value, (list, tuple)):
+        raise HTTPBadRequest(
+            title=_bad_title,
+            description=f'Parameter "{name}" was supplied more than once')
+    return value
+
+
 def get_request_field(name: str, req: Request, caseless: bool = False, default: str = None) -> str:
     bad_desc = f'Missing, empty, or misspelled parameter "{name}"'
     lcName = name.lower()
     if req.method == 'GET':
         for param in req.params.items():        # [name,value] tuples
             if param[0].lower() == lcName:
-                return param[1]
+                return _single_value(name, param[1])
         if default == None:
             raise HTTPBadRequest(title=_bad_title, description=bad_desc)                # Missing or incorrect casing
         return default                          # not in args, return default
@@ -133,10 +150,10 @@ def get_request_field(name: str, req: Request, caseless: bool = False, default: 
         if caseless:
             for fn in formdata.keys():
                 if fn.lower() == lcName:
-                    return formdata[fn]
+                    return _single_value(name, formdata[fn])
         else:
             if name in formdata and formdata[name] != '':
-                return formdata[name]
+                return _single_value(name, formdata[name])
         if default == None:
             raise HTTPBadRequest(title=_bad_title, description=bad_desc)                # Missing or incorrect casing
         return default
@@ -183,7 +200,7 @@ class PreProcessRequest():
         try:
             test = int(val)
             return test >= 0
-        except ValueError:
+        except (TypeError, ValueError):     # TypeError: not a scalar (see _single_value)
             return False
 
     def _check_request(self, req: Request, devnum: int):  # Raise on failure
