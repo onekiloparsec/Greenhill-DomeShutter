@@ -36,7 +36,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install server dependencies
-        run: pip install falcon toml
+        run: pip install falcon
 
       - name: Download Conform Universal
         run: |

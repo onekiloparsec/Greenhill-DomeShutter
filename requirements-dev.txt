@@ -5,7 +5,8 @@
 
 pytest>=8.0
 falcon>=4.0
-toml>=0.10
+# TOML is read with the stdlib tomllib (Python >= 3.11). On older interpreters
+# `pip install toml` restores the fallback path in device/config.py.
 
 # PINNED. uic embeds its own version in the generated file and formats output
 # slightly differently between releases, and CI checks that ui_dome.py is

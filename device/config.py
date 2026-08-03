@@ -44,22 +44,37 @@
 #
 import os
 import sys
-import toml
 import logging
+
+# LOCAL CHANGE (not upstream AlpycaDevice): read TOML with the standard
+# library. The third-party `toml` package broke the maintainer's frozen build
+# (pex could not resolve it without patching the import). Python >= 3.11 ships
+# tomllib; the fallback keeps older interpreters working if `toml` is installed.
+try:
+    import tomllib as _toml_reader
+
+    def _load_toml(path):
+        with open(path, 'rb') as fh:
+            return _toml_reader.load(fh)
+except ImportError:                     # Python < 3.11
+    import toml as _toml_reader
+
+    def _load_toml(path):
+        return _toml_reader.load(path)
 
 _dict = {}
 # Resolved relative to THIS FILE, not sys.path[0] as upstream does. The server
 # runs as a Windows service whose working directory is not the script directory,
 # and pytest sets sys.path[0] elsewhere again; both would fail to find the file.
 _config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.toml')
-_dict = toml.load(_config_path)    # Errors here are fatal.
+_dict = _load_toml(_config_path)    # Errors here are fatal.
 _dict2 = {}
 try:
     # ltf - this file, if it exists can override or supplement definitions
     # in the normal config.toml. This facilitates putting the driver in a
     # docker container where installation specific configuration can be
     # put in a file that isn't pulled from a repository
-    _dict2 = toml.load('/alpyca/config.toml')
+    _dict2 = _load_toml('/alpyca/config.toml')
 except:
     _dict2 = {}
     # file is optional so it's ok if it isn't there

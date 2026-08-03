@@ -15,7 +15,6 @@ import pytest
 from conftest import BOARD
 
 falcon = pytest.importorskip('falcon')
-pytest.importorskip('toml')
 from falcon import testing  # noqa: E402
 
 import dome_shutter  # noqa: E402
