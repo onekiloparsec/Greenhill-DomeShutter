@@ -28,7 +28,7 @@ resolved relative to the module so a Windows service can find it),
 ## Running
 
 ```bash
-pip install falcon toml
+pip install falcon    # TOML is read with the stdlib tomllib (Python >= 3.11)
 ```
 
 Against the real board, from the `device` directory:
@@ -131,39 +131,96 @@ progress for free via `Slewing`. It is deliberately deferred because:
 
 Revisit after the calibration survey, as an *addition* for the symmetric case.
 
-## Calibration — read before driving the real dome
+## Operator conventions — two scales, one boundary
 
-`config.toml` ships `calibrated = false` and the analogue limits inherited from
-`dome_shutter.py` (`0` closed, `235` open). **Those are guesses, never measured.**
-The server logs a warning at startup while they are in use.
+The **local PySide6 UI shows percent CLOSED**: sliders and bars read 100 when
+the dome is shut, matching the original controller the operators know. The
+**controller and the Alpaca surface are percent OPEN**: 0 = closed, 100 = open.
+The inversion lives in exactly one place, the `DomeWorker` slots in
+`dome_UI.py`. Do not add a second one anywhere else.
 
-Per shell, someone must record:
+Displayed positions (local UI and `Greenhill:GetShellStatus` alike) derive from
+`last_east`/`last_west`, not the live ADC reading. The pot jitters ±1 count at
+rest; the clamped-monotonic last-values are the maintainer's jitter-free
+solution, at the cost of a ~1 % jump on direction reversal. Safety logic keeps
+using the live reading.
 
-* the reading with the shell against its mechanical **closed** stop
-* the reading at its **open** limit switch
-* the at-rest jitter over ~60 s, which sets a sane `tolerance`
+## Calibration — what is known and what is still needed
 
-Why it matters:
+Confirmed by the maintainer from testing on the real board:
+
+* `235` is *"pretty close to correct"* for the open position on **both** shells
+* the at-rest ADC jitter is **±1 count** (so `tolerance = 2` is sane)
+* the relation between the analogue value and the *apparent* opening is
+  probably a **power law**, not linear
+
+Still to measure, per shell: the reading at the mechanical **closed** stop, and
+the `aperture_exponent` for that power law (`config.toml`, default `1.0` =
+linear; setpoint and readback share one pair of inverse transforms, so any
+exponent round-trips). If a pure power law fits poorly, a manual transform
+belongs in `Dome_Control._to_percent`/`_to_raw` — that is the seam.
+
+Why the closed value matters most:
 
 * a **closed** value above the truth → the position stop is never reached, so
   every close terminates by stalling into the hard stop
 * a **closed** value below the truth → the shell stops while still ajar, reed
   unmade, no fault reported. Software says shut; the dome is open a crack
-* a wrong **open** value → every intermediate aperture is proportionally wrong
 
-A bench logic board will not read the same as the dome. Keep one `config.toml`
-per installation rather than editing one back and forth.
+`config.toml` ships `calibrated = false` and warns at startup. A bench logic
+board will not read the same as the dome: keep one config per installation.
+
+## Switch states
+
+The three digital inputs, as enumerated by the maintainer (raw value = sum of
+bits; limits are active-low, the reed active-high):
+
+| raw | reed | east limit | west limit | Meaning |
+|----:|:---:|:---:|:---:|---|
+| 0 | – | open | open | dome fully open |
+| 1 | – | open | – | east fully open, west unknown |
+| 2 | – | – | open | west fully open, east unknown |
+| 3 | – | – | – | dome partially open (or closed but unconfirmed) |
+| **4** | shut | open | open | **FAULT, potentially fatal** — uppers shut, both lowers open |
+| **5** | shut | open | – | **FAULT** — uppers shut, east lower open |
+| **6** | shut | – | open | **FAULT** — uppers shut, west lower open |
+| 7 | shut | – | – | all closed |
+
+States 4–6 should be unreachable if the supervision works; if they are ever
+read, the affected shells are **driven closed immediately** (blind — neither
+the reed nor necessarily the position can be trusted there), west first and
+strictly sequential, because the IPS feeding the shutter motors also powers
+the mount, cameras and PC.
 
 ## Faults
 
-A shell that fails to open (the shared reed reads closed while it is moving)
-latches a fault. While latched:
+Latched per shell as a message plus a machine code (`Greenhill:GetShellStatus`
+reports both). While any fault is latched: `ShutterStatus` = `shutterError`,
+opening that shell is refused (`InvalidOperationException`, 0x40B), and
+**closing is never blocked** — it must not be possible to lock the dome open.
 
-* `ShutterStatus` reports `shutterError`
-* opening is refused (`InvalidOperationException`, 0x40B)
-* **closing is always permitted** — it must never be possible to lock the dome open
+| Code | Cause | Cleared by |
+|---|---|---|
+| `ICED` | Reed still made while opening past `ice_detect_counts`: the upper segments are stuck (icing). The shell stops at once and reseats with a short blind close. | **Auto**, when the reed releases (segments separated — maintainer-specified), or `ClearFault`. |
+| `SWITCH_STATE` | Impossible raw states 4/5/6 (table above). Emergency blind close fires. | **Manual only** — in this state a releasing reed could mean the uppers just fell. |
+| `CLOSE_STALL` | A close stalled short of closed without the reed confirming: shell may be ajar (water ingress risk in wind + rain). Stalling *at* the closed stop is the hard stop seating, not a fault. | **Auto**, when the reed confirms closed, or `ClearFault`. |
+| `EARLY_LIMIT` | Open limit engaged more than `early_limit_margin` counts below the calibrated open: suspected switch fault. | **Manual only.** |
 
-Clear with `Greenhill:ClearFault` once an operator has looked at the dome.
+**The ice-breaking procedure via Alpaca** (mirrors the existing manual one:
+open a little, reverse to the hard stop, repeat until the ice gives):
+`ClearFault` + `OpenShutter` performs one controlled cycle — the shell opens to
+`ice_detect_counts`, faults, and reseats itself. When the ice breaks the reed
+releases and the fault clears itself; normal operation resumes with no further
+operator action.
+
+A goto (target-armed) close is position-governed: a stuck-made reed cannot fake
+its completion. Manual full closes keep the reed as their legitimate
+"both shells closed" stop.
+
+**Open hardware question (maintainer):** the board *may* reset the analogue
+position to 0 while the reed is engaged. If it does, the `ICED` trigger never
+fires (position pinned at 0 while the lower shell moves) and the protection is
+dead. This must be settled on hardware before the dome runs unattended.
 
 ## Testing
 
@@ -211,10 +268,28 @@ layer inherited from the AlpycaDevice sample:
    connection on its own thread. Confirmed by contrast with the reference ASCOM
    Alpaca Simulators, which keeps the connection open.
 
+## Commissioning checklist (on the real dome, from the maintainer)
+
+1. **Settle the reed/position question** above: does the board reset the
+   analogue position while the reed is engaged? The `ICED` protection depends
+   on the answer.
+2. **Partial-open operation**: confirm the dome closes from every partially
+   open state and that nothing (including latched faults) blocks a close.
+3. **Simulate the frozen-shut fault**: clamp the upper segments (multiple
+   clamps) and verify the `ICED` detect → stop → reseat cycle against real
+   motors.
+4. **Verify "closed" is truly seated**: if the segments rest slightly ajar,
+   water can ingress in high wind + rain. If so, consider a hold-on delay
+   before de-energising at the end of a close (the legacy controller kept the
+   motor powered ~1.5 s after reaching closed) — deliberately **not**
+   implemented yet; it needs the real dome to tune.
+5. Re-run both ASCOM Conform suites against the real hardware.
+6. The calibration survey: closed readings, the aperture exponent, and a check
+   of the full-travel time against `emergency_close_seconds`.
+
 ## Not yet done
 
-* Conform has only been run against the **simulator**. It must be run against the
-  real dome before the server drives motors unattended: the simulator cannot
-  reproduce sensor faults or real travel timing.
+* Conform has only been run against the **simulator**; see the checklist.
 * No Windows service packaging yet (NSSM or similar).
 * `SlewToAltitude`, pending calibration.
+* The close seat-delay (checklist item 4), if the real dome shows it is needed.
