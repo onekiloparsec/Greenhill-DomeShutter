@@ -1,6 +1,6 @@
 # Development and CI dependencies.
 #
-# Runtime deps for the Alpaca server (device/) are falcon and toml; everything
+# The Alpaca server's only runtime dependency (device/) is falcon; everything
 # else here is for testing and for regenerating the Qt UI.
 
 pytest>=8.0
