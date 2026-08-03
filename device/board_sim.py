@@ -17,10 +17,8 @@ Install it before importing dome_shutter:
     install()
     import dome_shutter
 """
-import sys
 import threading
 import time
-import types
 
 # Channel numbers, mirroring Dome_Control
 EAST_OPEN, EAST_CLOSE = 6, 7
@@ -142,19 +140,9 @@ class SimulatedBoard:
 
 def install(board=None, animate=False):
     """
-    Redirect ctypes.WinDLL to a SimulatedBoard and stub the Windows-only
-    imports, so dome_shutter can be imported off Windows. Returns the board.
+    Redirect ctypes.WinDLL to a SimulatedBoard, so dome_shutter drives the
+    simulation instead of a real K8055. Returns the board.
     """
-    for name in ("win32com", "win32com.client", "pythoncom",
-                 "pydub", "pydub.playback"):
-        module = types.ModuleType(name)
-        module.Dispatch = lambda *a, **k: None
-        module.CoInitialize = lambda *a, **k: None
-        module.CoUninitialize = lambda *a, **k: None
-        module.play = lambda *a, **k: None
-        sys.modules.setdefault(name, module)
-    sys.modules["win32com"].client = sys.modules["win32com.client"]
-
     import ctypes
     sim = board or SimulatedBoard(animate=animate)
     ctypes.WinDLL = lambda path: sim

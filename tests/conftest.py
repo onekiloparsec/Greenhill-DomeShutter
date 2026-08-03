@@ -1,12 +1,12 @@
-"""Shared stubs so the dome code can be imported and driven with no hardware.
+"""Shared test rig: dome code drivable with no hardware.
 
-The Windows-only modules (win32com, pythoncom) and pydub are replaced with
-inert stand-ins, and ctypes.WinDLL is redirected to a fake K8055 that models
-the one behaviour that matters: digital outputs latch until cleared.
+ctypes.WinDLL is redirected to a fake K8055 that models the one behaviour that
+matters: digital outputs latch until cleared. Nothing else needs stubbing --
+dome_shutter.py has no Windows-only imports since the Telescope/TCP/RDP/speaker
+subsystems were removed.
 """
 import os
 import sys
-import types
 import threading
 import time
 
@@ -17,15 +17,6 @@ DEVICE_DIR = os.path.join(REPO_ROOT, 'device')
 for path in (REPO_ROOT, DEVICE_DIR):
     if path not in sys.path:
         sys.path.insert(0, path)
-
-for _name in ("win32com", "win32com.client", "pythoncom", "pydub", "pydub.playback"):
-    _m = types.ModuleType(_name)
-    _m.Dispatch = lambda *a, **k: None
-    _m.CoInitialize = lambda *a, **k: None
-    _m.CoUninitialize = lambda *a, **k: None
-    _m.play = lambda *a, **k: None
-    sys.modules.setdefault(_name, _m)
-sys.modules["win32com"].client = sys.modules["win32com.client"]
 
 import ctypes  # noqa: E402
 
