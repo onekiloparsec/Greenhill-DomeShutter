@@ -427,6 +427,11 @@ class Dome_Control:
                     'percent': self._to_percent(self.east_position,
                                                 self.east_closed_position,
                                                 self.east_open_position),
+                    # jitter-free variant for anything user-facing; see
+                    # east_display_percent()
+                    'display_percent': self._to_percent(self.last_east,
+                                                        self.east_closed_position,
+                                                        self.east_open_position),
                     'state': self.e_state,
                     'target': self.east_target,
                     'fault': self.e_fault,
@@ -436,6 +441,9 @@ class Dome_Control:
                     'percent': self._to_percent(self.west_position,
                                                 self.west_closed_position,
                                                 self.west_open_position),
+                    'display_percent': self._to_percent(self.last_west,
+                                                        self.west_closed_position,
+                                                        self.west_open_position),
                     'state': self.w_state,
                     'target': self.west_target,
                     'fault': self.w_fault,
@@ -521,15 +529,36 @@ class Dome_Control:
         return max(0.0, min(100.0, (raw - closed_position) / float(span) * 100.0))
 
     def east_percent_open(self):
-        """East shutter aperture, 0 = closed, 100 = fully open."""
+        """East shutter aperture, 0 = closed, 100 = fully open. Live reading."""
         with self._lock:
             return self._to_percent(self.east_position, self.east_closed_position,
                                     self.east_open_position)
 
     def west_percent_open(self):
-        """West shutter aperture, 0 = closed, 100 = fully open."""
+        """West shutter aperture, 0 = closed, 100 = fully open. Live reading."""
         with self._lock:
             return self._to_percent(self.west_position, self.west_closed_position,
+                                    self.west_open_position)
+
+    def east_display_percent(self):
+        """
+        East aperture for DISPLAY, from last_east rather than the live reading.
+
+        The ADC jitters by about +/-1 count at rest, so a display fed the live
+        position flickers. last_east/last_west are clamped monotonic while a
+        move is in progress (max while opening, min while closing) and frozen
+        when stopped, so they are jitter-free; the only artifact is a ~1 count
+        jump on a direction reversal, which the maintainer deems acceptable.
+        This mirrors the original UI, which read last_east/last_west directly.
+        """
+        with self._lock:
+            return self._to_percent(self.last_east, self.east_closed_position,
+                                    self.east_open_position)
+
+    def west_display_percent(self):
+        """West aperture for display; see east_display_percent for why last_west."""
+        with self._lock:
+            return self._to_percent(self.last_west, self.west_closed_position,
                                     self.west_open_position)
 
     def _convert_west_set(self, percentage):

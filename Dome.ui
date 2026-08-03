@@ -315,7 +315,7 @@ QProgressBar::chunk {
      </sizepolicy>
     </property>
     <property name="value">
-     <number>0</number>
+     <number>100</number>
     </property>
     <property name="orientation">
      <enum>Qt::Orientation::Vertical</enum>
@@ -492,7 +492,7 @@ QProgressBar::chunk {
      </palette>
     </property>
     <property name="value">
-     <number>0</number>
+     <number>100</number>
     </property>
     <property name="orientation">
      <enum>Qt::Orientation::Vertical</enum>
@@ -514,7 +514,7 @@ QProgressBar::chunk {
      <number>100</number>
     </property>
     <property name="sliderPosition">
-     <number>0</number>
+     <number>100</number>
     </property>
     <property name="orientation">
      <enum>Qt::Orientation::Vertical</enum>
@@ -545,7 +545,7 @@ QProgressBar::chunk {
      <number>100</number>
     </property>
     <property name="sliderPosition">
-     <number>0</number>
+     <number>100</number>
     </property>
     <property name="orientation">
      <enum>Qt::Orientation::Vertical</enum>

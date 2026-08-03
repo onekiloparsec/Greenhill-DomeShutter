@@ -274,17 +274,22 @@ class GreenhillDome:
         return {'accepted': True, 'targets': targets}
 
     def shell_status(self):
-        """Per-shell detail, which the collapsed ShutterStatus cannot carry."""
+        """Per-shell detail, which the collapsed ShutterStatus cannot carry.
+
+        'percent' is the jitter-free display value (derived from the clamped
+        monotonic last-position, not the live ADC reading), so a client
+        rendering it does not flicker with the +/-1 count pot noise.
+        """
         snap = self._require().snapshot()
         return {
             'east': {
-                'percent': round(snap['east']['percent'], 1),
+                'percent': round(snap['east']['display_percent'], 1),
                 'state': snap['east']['state'],
                 'target': snap['east']['target'],
                 'fault': snap['east']['fault'],
             },
             'west': {
-                'percent': round(snap['west']['percent'], 1),
+                'percent': round(snap['west']['display_percent'], 1),
                 'state': snap['west']['state'],
                 'target': snap['west']['target'],
                 'fault': snap['west']['fault'],

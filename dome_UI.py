@@ -40,9 +40,12 @@ class DomeWorker(QObject):
 
     @Slot(int)
     def west_goto(self, value):
-        # one convention everywhere: 0 = closed, 100 = fully open
-        self.west_status.emit(f"WEST SETPOINT {value}% open")
-        self.dome.goto_w(value)
+        # OPERATOR CONVENTION (maintainer's choice): the local UI shows percent
+        # CLOSED -- slider at 100 = closed, 0 = open -- matching the original
+        # dome controller. The inversion lives HERE, at the UI boundary, and
+        # only here: Dome_Control and the Alpaca surface are percent OPEN.
+        self.west_status.emit(f"WEST SETPOINT {value}")
+        self.dome.goto_w(100 - value)
 
     @Slot()
     def east_open(self):
@@ -61,18 +64,23 @@ class DomeWorker(QObject):
 
     @Slot(int)
     def east_goto(self, value):
-        self.east_status.emit(f"EAST SETPOINT {value}% open")
-        self.dome.goto_e(value)
+        # percent closed in, percent open to the controller -- see west_goto
+        self.east_status.emit(f"EAST SETPOINT {value}")
+        self.dome.goto_e(100 - value)
 
     @Slot()
     def dome_position(self):
-        # percent open, matching the setpoint sliders. Previously this emitted
-        # raw analogue counts (0-235) into a 0-100 progress bar, so the display
-        # pegged at full for anything past ~43% open. Also reads the live
-        # position rather than last_east/last_west, which track the travel
-        # extreme for stall detection and are not a position readout.
-        self.east_position.emit(int(round(self.dome.east_percent_open())))
-        self.west_position.emit(int(round(self.dome.west_percent_open())))
+        # Progress bars show percent CLOSED (100 = fully closed), the operator
+        # convention, hence the inversion of the controller's percent open.
+        #
+        # display_percent derives from last_east/last_west rather than the live
+        # ADC reading: the pot jitters +/-1 count at rest, and the clamped
+        # monotonic last_* values are the maintainer's jitter-free solution
+        # (worst case: a ~1% jump on direction reversal). Previously this
+        # emitted raw analogue counts (0-235) into a 0-100 progress bar, so the
+        # display pegged at full past ~43% of travel.
+        self.east_position.emit(int(round(100 - self.dome.east_display_percent())))
+        self.west_position.emit(int(round(100 - self.dome.west_display_percent())))
 
 
 

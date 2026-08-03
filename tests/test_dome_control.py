@@ -91,6 +91,20 @@ def test_percent_open_is_clamped_outside_calibrated_travel(quiet_dome):
     assert quiet_dome.east_percent_open() == 100.0
 
 
+def test_display_percent_is_immune_to_adc_jitter(quiet_dome):
+    # The pot jitters +/-1 count at rest. The display value derives from
+    # last_east (clamped monotonic during motion, frozen when stopped), the
+    # maintainer's jitter-free solution, so it must not follow the live wiggle.
+    place_east(quiet_dome, 118)                      # 50% and stationary
+    baseline = quiet_dome.east_display_percent()
+    for wiggle in (117, 119, 118, 117, 119):
+        BOARD.analog[2] = wiggle
+        quiet_dome.east_position = wiggle            # live value follows the ADC
+        assert quiet_dome.east_display_percent() == baseline
+    # the live accessor, by contrast, is allowed to move
+    assert quiet_dome.east_percent_open() != baseline
+
+
 def test_a_higher_setpoint_opens_and_a_lower_one_closes(quiet_dome):
     # the setpoint is percent OPEN, so a larger number must drive towards open.
     # An inversion anywhere in the chain shows up here.
