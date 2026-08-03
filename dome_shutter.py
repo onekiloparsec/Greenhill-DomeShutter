@@ -64,11 +64,28 @@ class Dome_Control:
         self.velleman = _Velleman()
         self.e_state = 'stopped'
         self.w_state = 'stopped'
-        # Latched faults. A shell that failed to open (the shared reed switch
-        # read closed while it was moving) must not be silently reported as
-        # merely 'stopped': Alpaca has to surface it as shutterError.
+        # Latched faults: a human-readable message plus a machine code.
+        # Codes and their clear conditions (see _update_status):
+        #   ICED         reed stayed made while opening (dome iced shut).
+        #                Auto-clears when the reed opens: the segments have
+        #                separated, the hazard is over. Until then, ClearFault +
+        #                Open performs one controlled ice-breaking cycle (open a
+        #                little, auto-reverse to the hard stop) -- the
+        #                observatory's existing manual procedure.
+        #   SWITCH_STATE the "impossible" switch combinations (raw 4/5/6): the
+        #                shared reed says the upper segments are shut while a
+        #                lower shell sits at its OPEN limit. Potentially fatal
+        #                (detached uppers can freefall), so the shell is driven
+        #                closed immediately. Manual clear only, after inspection.
+        #   CLOSE_STALL  a close stalled with the shell not confirmed closed.
+        #                Auto-clears if the reed later confirms closed.
+        #   EARLY_LIMIT  an open limit switch engaged far from the calibrated
+        #                open position: suspected switch fault. Manual clear.
+        # A latched fault refuses OPENS on that shell; closing is never blocked.
         self.e_fault = None
         self.w_fault = None
+        self.e_fault_code = None
+        self.w_fault_code = None
         self._lock = threading.RLock()
         # output ports for opening/closing
         self.eosw = 6  # east open channel
@@ -89,6 +106,21 @@ class Dome_Control:
         self.east_target = None
         self.west_target = None
         self.tolerance = 2
+        # Counts of travel that arm the iced-shut detection: reed still made
+        # beyond this much opening means the upper segments are stuck.
+        # CAVEAT (maintainer): the board MAY reset the analogue position to 0
+        # while the reed is engaged -- unconfirmed. If it does, this trigger
+        # never fires; must be verified on hardware during commissioning.
+        self.ice_detect_counts = 15
+        # An open limit switch engaging more than this many counts below the
+        # calibrated open position latches an EARLY_LIMIT fault.
+        self.early_limit_margin = 15
+        # Blind-close durations (the reed cannot be trusted in either case):
+        # the short one reseats an iced shell from <= ice_detect_counts of
+        # travel; the long one must cover FULL travel (~9 s) plus margin, for
+        # the emergency close out of an impossible switch state.
+        self.drive_close_seconds = 2.0
+        self.emergency_close_seconds = 12.0
         self.east_position, self.west_position = self._read_shutter_positions()
         self.last_east, self.last_west = self.east_position, self.west_position
         # UNCALIBRATED DEFAULTS -- the original author's guesses. A closed
@@ -103,6 +135,10 @@ class Dome_Control:
             self.west_closed_position = calibration.get('west_closed', self.west_closed_position)
             self.west_open_position = calibration.get('west_open', self.west_open_position)
             self.tolerance = calibration.get('tolerance', self.tolerance)
+            self.ice_detect_counts = calibration.get('ice_detect_counts', self.ice_detect_counts)
+            self.early_limit_margin = calibration.get('early_limit_margin', self.early_limit_margin)
+            self.drive_close_seconds = calibration.get('drive_close_seconds', self.drive_close_seconds)
+            self.emergency_close_seconds = calibration.get('emergency_close_seconds', self.emergency_close_seconds)
         for name, closed, opened in (('east', self.east_closed_position, self.east_open_position),
                                      ('west', self.west_closed_position, self.west_open_position)):
             if opened <= closed:
@@ -215,13 +251,26 @@ class Dome_Control:
             self.velleman.clear_output(self.eosw)
             self.velleman.set_output(self.ecsw)
 
-    def _drive_close_e(self):
+    def _drive_close_e(self, duration=None):
         """
-        Serves as a failsafe way to have the dome drive closed in the case of the closed switch failing on
+        Blind time-based close, for exactly the cases where the sensors cannot
+        be trusted: a reed switch stuck made (iced dome, failed switch) would
+        end a normal close instantly, and the analogue position may be suspect
+        too (the board possibly resets it while the reed is engaged).
+
+        MUST be called from its own thread, never from the monitor: it sleeps,
+        and the monitor sleeping means neither shell is supervised.
+
+        :param duration: seconds to drive; defaults to drive_close_seconds
+            (reseating an iced shell from a small opening). Emergency closes
+            from an impossible switch state pass emergency_close_seconds, which
+            covers full travel.
         """
-        if self.e_state == 'opening':
+        if self.e_state != 'stopped':
             self.stop_e()
-            time.sleep(self.dir_delay)
+        # Always pause before energising: the motor may have been running the
+        # other way moments ago, and a plug reversal is what dir_delay prevents.
+        time.sleep(self.dir_delay)
         with self._lock:
             if not self._may_energise(None):
                 return  # shutting down: do not energise anything
@@ -229,9 +278,8 @@ class Dome_Control:
             self.velleman.clear_output(self.eosw)
             self.velleman.set_output(self.ecsw)
         try:
-            # TODO: replace with logic using dome position
             # wait() not sleep(): a shutdown must not have to wait this out
-            self._stop_event.wait(2)  # let the dome close fully
+            self._stop_event.wait(duration if duration is not None else self.drive_close_seconds)
         finally:
             # an exception here must never leave the close relay latched
             self.stop_e()
@@ -322,13 +370,14 @@ class Dome_Control:
             self.velleman.clear_output(self.wosw)
             self.velleman.set_output(self.wcsw)
 
-    def _drive_close_w(self):
+    def _drive_close_w(self, duration=None):
         """
-        Serves as a failsafe way to have the dome drive closed in the case of the closed switch failing on
+        Blind time-based close for the west shell; see _drive_close_e.
+        MUST be called from its own thread, never from the monitor.
         """
-        if self.w_state == 'opening':
+        if self.w_state != 'stopped':
             self.stop_w()
-            time.sleep(self.dir_delay)
+        time.sleep(self.dir_delay)
         with self._lock:
             if not self._may_energise(None):
                 return  # shutting down: do not energise anything
@@ -336,8 +385,7 @@ class Dome_Control:
             self.velleman.clear_output(self.wosw)
             self.velleman.set_output(self.wcsw)
         try:
-            # TODO: replace with logic using dome position
-            self._stop_event.wait(2)  # let the dome close fully
+            self._stop_event.wait(duration if duration is not None else self.drive_close_seconds)
         finally:
             self.stop_w()
 
@@ -435,6 +483,7 @@ class Dome_Control:
                     'state': self.e_state,
                     'target': self.east_target,
                     'fault': self.e_fault,
+                    'fault_code': self.e_fault_code,
                 },
                 'west': {
                     'position': self.west_position,
@@ -447,6 +496,7 @@ class Dome_Control:
                     'state': self.w_state,
                     'target': self.west_target,
                     'fault': self.w_fault,
+                    'fault_code': self.w_fault_code,
                 },
                 'switches': self._read_shutter_switches(),
                 'moving': self.e_state != 'stopped' or self.w_state != 'stopped',
@@ -454,7 +504,7 @@ class Dome_Control:
             }
 
     def faults(self):
-        """Latched faults as {'east': str|None, 'west': str|None}."""
+        """Latched fault messages as {'east': str|None, 'west': str|None}."""
         with self._lock:
             return {'east': self.e_fault, 'west': self.w_fault}
 
@@ -463,8 +513,30 @@ class Dome_Control:
         with self._lock:
             if shell in ('east', 'both'):
                 self.e_fault = None
+                self.e_fault_code = None
             if shell in ('west', 'both'):
                 self.w_fault = None
+                self.w_fault_code = None
+
+    def _latch_fault(self, shell, code, message):
+        """Latch a fault (call with the lock held). Latching is sticky until
+        the code's clear condition is met or an operator clears it."""
+        if shell == 'e':
+            self.e_fault, self.e_fault_code = message, code
+        else:
+            self.w_fault, self.w_fault_code = message, code
+        name = 'East' if shell == 'e' else 'West'
+        print(f"FAULT[{code}] {name}: {message}")
+
+    def _clear_fault(self, shell, reason):
+        """Auto-clear a fault whose clear condition has been met (lock held)."""
+        name = 'East' if shell == 'e' else 'West'
+        if shell == 'e':
+            print(f"Fault cleared ({name}): {reason} (was: {self.e_fault})")
+            self.e_fault, self.e_fault_code = None, None
+        else:
+            print(f"Fault cleared ({name}): {reason} (was: {self.w_fault})")
+            self.w_fault, self.w_fault_code = None, None
 
     def _stagger(self, first, second):
         """
@@ -495,6 +567,32 @@ class Dome_Control:
                 self.stop_e()
                 self.stop_w()
 
+        threading.Thread(target=run, daemon=True).start()
+
+    def _start_emergency_close(self, east=False, west=False):
+        """
+        Drive the flagged shells closed with the long blind close, on a
+        dedicated thread. Used for the impossible switch states, where neither
+        the reed nor necessarily the position can be trusted.
+
+        Sequential, west first: the telescope parks on the west side, and the
+        shells never draw start-up current together (the IPS also powers the
+        mount, cameras and PC). Each blind close runs to completion before the
+        next starts, which satisfies the stagger requirement by construction.
+        """
+        def run():
+            try:
+                if west:
+                    self._drive_close_w(duration=self.emergency_close_seconds)
+                if east and not self._stop_event.is_set():
+                    self._drive_close_e(duration=self.emergency_close_seconds)
+            except Exception as e:
+                print(f"Error during emergency close: {e}")
+                self.stop_both()
+
+        print("EMERGENCY CLOSE: driving "
+              + ' and '.join(n for n, f in (('west', west), ('east', east)) if f)
+              + " closed, blind")
         threading.Thread(target=run, daemon=True).start()
 
     def open_both(self):
@@ -621,6 +719,41 @@ class Dome_Control:
             self.east_position, self.west_position = self._read_shutter_positions()
             now = time.time()
 
+            # ---- fault auto-clears (conditions chosen by the maintainer) ----
+            if not switches['all_closed']:
+                # The reed has opened: the upper segments have separated, so the
+                # iced-shut hazard is over and operation is re-allowed.
+                if self.e_fault_code == 'ICED':
+                    self._clear_fault('e', 'all-closed switch released')
+                if self.w_fault_code == 'ICED':
+                    self._clear_fault('w', 'all-closed switch released')
+            else:
+                # The reed positively confirms closed: a stalled close that
+                # worried us has in fact seated.
+                if self.e_fault_code == 'CLOSE_STALL':
+                    self._clear_fault('e', 'all-closed switch confirms closed')
+                if self.w_fault_code == 'CLOSE_STALL':
+                    self._clear_fault('w', 'all-closed switch confirms closed')
+
+            # ---- impossible switch states (raw 4, 5, 6) ----
+            # The shared reed says the upper segments are shut while a lower
+            # shell sits at its OPEN limit. Per the maintainer this is
+            # potentially fatal -- detached upper segments can freefall,
+            # shocking pulleys, cables and motors -- so the affected shells are
+            # driven closed IMMEDIATELY, blind (the reed is self-evidently not
+            # trustworthy in this state, and the position may not be either).
+            if switches['all_closed'] and (switches['east_limit'] or switches['west_limit']):
+                east_new = switches['east_limit'] and self.e_fault_code != 'SWITCH_STATE'
+                west_new = switches['west_limit'] and self.w_fault_code != 'SWITCH_STATE'
+                if east_new:
+                    self._latch_fault('e', 'SWITCH_STATE',
+                                      'all-closed reed made while the east open limit is engaged')
+                if west_new:
+                    self._latch_fault('w', 'SWITCH_STATE',
+                                      'all-closed reed made while the west open limit is engaged')
+                if east_new or west_new:
+                    self._start_emergency_close(east=east_new, west=west_new)
+
             def _east_set_reached():
                 # logic for reaching set position, if one is active on motor activation
                 if self.east_target is None:
@@ -656,17 +789,26 @@ class Dome_Control:
                 # stop if the dome is on the soft limit switch
                 elif switches['east_limit']:
                     print("East shutter fully open, stopping")
+                    if self.east_position < self.east_open_position - self.early_limit_margin:
+                        # far short of calibrated open: suspect switch fault
+                        self._latch_fault('e', 'EARLY_LIMIT',
+                                          f'open limit engaged early at {self.east_position} counts '
+                                          f'(expected ~{self.east_open_position})')
                     self.stop_e()
-                    self.east_target = None
-                elif switches['all_closed'] and self.east_position > self.east_closed_position + 15 :
+                elif switches['all_closed'] and self.east_position > self.east_closed_position + self.ice_detect_counts:
                     print("Dome opening failed, stopping")
-                    # Stop command issued as part of _drive_close_e below
-                    self.east_target = None
-                    # latch it: the shell is left partially open with the reed
-                    # claiming closed, which Alpaca must report as shutterError
-                    self.e_fault = 'opening failed: all-closed switch made while opening'
-                    # Dome is going to be in a partially open state now, and closing will not work as the switch says closed
-                    self._drive_close_e()
+                    # The upper segments are stuck (icing): only the lower shell
+                    # is moving. Stop NOW -- opening further risks the uppers
+                    # detaching and freefalling -- then reseat with a short
+                    # blind close (the stuck reed would end a normal close
+                    # instantly). ClearFault + Open repeats the ice-breaking
+                    # cycle; the fault auto-clears when the reed releases.
+                    self.stop_e()
+                    self._latch_fault('e', 'ICED',
+                                      'all-closed switch still made while opening: dome may be iced shut')
+                    # On a thread: the monitor must never sleep, or the other
+                    # shell goes unsupervised for the whole blind close.
+                    threading.Thread(target=self._drive_close_e, daemon=True).start()
                 # stop the motors if a drive to position has been issued and we are close to that position
                 elif _east_set_reached():
                     self.stop_e()
@@ -680,13 +822,21 @@ class Dome_Control:
                     self.e_timer = now
                 if (now - self.e_timer) > 1:
                     print("East shutter closing timeout, stopping")
+                    if (not switches['all_closed']
+                            and self.east_position > self.east_closed_position + self.tolerance):
+                        # stalled well short of closed with no reed confirmation:
+                        # the shell may be ajar. Auto-clears if the reed later
+                        # confirms closed.
+                        self._latch_fault('e', 'CLOSE_STALL',
+                                          f'stalled while closing at {self.east_position} counts '
+                                          f'without the all-closed switch')
                     self.stop_e()
-                    self.east_target = None
-                # this is only true when west is also closed
-                elif switches['all_closed']:
+                # Only true when west is also closed. Gated on "no target": a
+                # target-armed close is position-governed, so a stuck-made reed
+                # (iced dome) cannot fake its completion.
+                elif switches['all_closed'] and self.east_target is None:
                     print("East shutter fully closed, stopping")
                     self.stop_e()
-                    self.east_target = None
                 # stop when we reach the shut position
                 elif self.east_position <= self.east_closed_position:
                     print("East shutter fully closed, stopping")
@@ -708,14 +858,18 @@ class Dome_Control:
                     self.west_target = None
                 elif switches['west_limit']:
                     print("West shutter fully open, stopping")
+                    if self.west_position < self.west_open_position - self.early_limit_margin:
+                        self._latch_fault('w', 'EARLY_LIMIT',
+                                          f'open limit engaged early at {self.west_position} counts '
+                                          f'(expected ~{self.west_open_position})')
                     self.stop_w()
-                    self.west_target = None
-                elif switches['all_closed'] and self.west_position > self.west_closed_position + 15 :
+                elif switches['all_closed'] and self.west_position > self.west_closed_position + self.ice_detect_counts:
                     print("Dome opening failed, stopping")
-                    # Stop command issued as part of _drive_close_w()
-                    self.west_target = None
-                    self.w_fault = 'opening failed: all-closed switch made while opening'
-                    self._drive_close_w()
+                    # see the east branch: iced-shut handling
+                    self.stop_w()
+                    self._latch_fault('w', 'ICED',
+                                      'all-closed switch still made while opening: dome may be iced shut')
+                    threading.Thread(target=self._drive_close_w, daemon=True).start()
                 elif _west_set_reached():
                     self.stop_w()
                     self.west_target = None
@@ -725,12 +879,16 @@ class Dome_Control:
                     self.w_timer = now
                 if (now - self.w_timer) > 1:
                     print("West shutter closing timeout, stopping")
+                    if (not switches['all_closed']
+                            and self.west_position > self.west_closed_position + self.tolerance):
+                        self._latch_fault('w', 'CLOSE_STALL',
+                                          f'stalled while closing at {self.west_position} counts '
+                                          f'without the all-closed switch')
                     self.stop_w()
-                    self.west_target = None
-                elif switches['all_closed']:
+                # gated on "no target" for the same stuck-reed reason as east
+                elif switches['all_closed'] and self.west_target is None:
                     print("West shutter fully closed, stopping")
                     self.stop_w()
-                    self.west_target = None
                 elif self.west_position <= self.west_closed_position:
                     print("West shutter fully closed, stopping")
                     self.stop_w()
