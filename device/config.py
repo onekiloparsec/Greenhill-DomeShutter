@@ -125,6 +125,7 @@ class Config:
     west_closed: int = get_toml('calibration', 'west_closed')
     west_open: int = get_toml('calibration', 'west_open')
     tolerance: int = get_toml('calibration', 'tolerance')
+    aperture_exponent: float = get_toml('calibration', 'aperture_exponent')
     calibrated: bool = get_toml('calibration', 'calibrated')
     # ---------------
     # Logging Section

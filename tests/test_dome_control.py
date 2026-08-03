@@ -91,6 +91,32 @@ def test_percent_open_is_clamped_outside_calibrated_travel(quiet_dome):
     assert quiet_dome.east_percent_open() == 100.0
 
 
+def test_aperture_exponent_round_trips_and_keeps_endpoints(board):
+    # The maintainer suspects a power relation between raw counts and apparent
+    # opening. Whatever exponent the survey produces, setpoint -> raw ->
+    # readback must agree with itself, and closed/open must stay exact.
+    d = dome_shutter.Dome_Control(calibration={'aperture_exponent': 2.0})
+    d._stop_event.set()
+    try:
+        assert d._convert_east_set(0) == 0
+        assert d._convert_east_set(100) == 235
+        # apparent 50% with k=2 -> raw fraction sqrt(0.5) -> 166 counts
+        raw = d._convert_east_set(50)
+        assert raw == 166
+        assert round(d._to_percent(raw, 0, 235)) == 50
+        for pct in (10, 25, 60, 90):
+            back = d._to_percent(d._convert_east_set(pct), 0, 235)
+            assert abs(back - pct) < 1.0, f'{pct}% round-tripped to {back}'
+    finally:
+        d.shutdown()
+
+
+def test_bad_aperture_exponent_is_rejected(board):
+    for bad in (0, -1, float('nan'), 'two'):
+        with pytest.raises(ValueError):
+            dome_shutter.Dome_Control(calibration={'aperture_exponent': bad})
+
+
 def test_display_percent_is_immune_to_adc_jitter(quiet_dome):
     # The pot jitters +/-1 count at rest. The display value derives from
     # last_east (clamped monotonic during motion, frozen when stopped), the

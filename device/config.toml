@@ -34,10 +34,16 @@ sync_write_connected = true     # True to emulate sync Connected = true (for Con
 [calibration]
 calibrated = false          # set true ONLY once the values below are measured
 east_closed = 0
-east_open = 235
+east_open = 235             # maintainer: "pretty close to correct" on the real dome
 west_closed = 0
-west_open = 235
-tolerance = 2               # counts; must exceed the analogue noise floor
+west_open = 235             # (both shells; measured against actual shutter input)
+tolerance = 2               # counts; ADC jitter measured at +/-1 count at rest
+
+# Raw travel fraction -> APPARENT opening fraction: apparent = raw ** exponent.
+# The maintainer has observed the relation is probably a power law, not linear.
+# 1.0 keeps today's linear behaviour; measure during the calibration survey and
+# note that a manual transform may be needed if a pure power law fits poorly.
+aperture_exponent = 1.0
 
 [logging]
 log_level = 'INFO'

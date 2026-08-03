@@ -67,6 +67,7 @@ def start_dome_device(logger: Logger):
             'west_closed': Config.west_closed,
             'west_open': Config.west_open,
             'tolerance': Config.tolerance,
+            'aperture_exponent': Config.aperture_exponent,
         }
     else:
         logger.warning('==CALIBRATION== config.toml has calibrated = false. The '

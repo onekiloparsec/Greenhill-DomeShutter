@@ -121,6 +121,9 @@ class Dome_Control:
         # the emergency close out of an impossible switch state.
         self.drive_close_seconds = 2.0
         self.emergency_close_seconds = 12.0
+        # raw travel fraction -> apparent opening fraction, apparent = raw**k.
+        # The maintainer suspects a power relation; 1.0 = linear until measured.
+        self.aperture_exponent = 1.0
         self.east_position, self.west_position = self._read_shutter_positions()
         self.last_east, self.last_west = self.east_position, self.west_position
         # UNCALIBRATED DEFAULTS -- the original author's guesses. A closed
@@ -139,6 +142,10 @@ class Dome_Control:
             self.early_limit_margin = calibration.get('early_limit_margin', self.early_limit_margin)
             self.drive_close_seconds = calibration.get('drive_close_seconds', self.drive_close_seconds)
             self.emergency_close_seconds = calibration.get('emergency_close_seconds', self.emergency_close_seconds)
+            self.aperture_exponent = calibration.get('aperture_exponent', self.aperture_exponent)
+        if not (isinstance(self.aperture_exponent, (int, float))
+                and math.isfinite(self.aperture_exponent) and self.aperture_exponent > 0):
+            raise ValueError(f"aperture_exponent must be a positive number, got {self.aperture_exponent!r}")
         for name, closed, opened in (('east', self.east_closed_position, self.east_open_position),
                                      ('west', self.west_closed_position, self.west_open_position)):
             if opened <= closed:
@@ -434,7 +441,8 @@ class Dome_Control:
         fraction = float(percentage) / 100.0
         if not math.isfinite(fraction):
             raise ValueError(f"Shutter setpoint must be a finite percentage, got {percentage!r}")
-        return int(round(max(0.0, min(1.0, fraction)) * (open_position - closed_position) + closed_position))
+        fraction = max(0.0, min(1.0, fraction)) ** (1.0 / self.aperture_exponent)
+        return int(round(fraction * (open_position - closed_position) + closed_position))
 
     # ------------------------------------------------------------------ #
     # Whole-dome operations                                              #
@@ -620,11 +628,18 @@ class Dome_Control:
         Inverse of _to_raw: a raw analogue reading as a percentage open.
         Clamped, because the reading can sit slightly outside the calibrated
         travel through sensor noise or an imperfect calibration.
+
+        aperture_exponent maps raw travel to APPARENT opening: the maintainer
+        has observed the relation between the shutter's analogue value and the
+        visible aperture is probably a power law, not linear. 1.0 (identity)
+        until the survey measures it; _to_raw applies the inverse so setpoint
+        and readback always round-trip.
         """
         span = open_position - closed_position
         if span == 0:
             return 0.0
-        return max(0.0, min(100.0, (raw - closed_position) / float(span) * 100.0))
+        fraction = max(0.0, min(1.0, (raw - closed_position) / float(span)))
+        return 100.0 * fraction ** self.aperture_exponent
 
     def east_percent_open(self):
         """East shutter aperture, 0 = closed, 100 = fully open. Live reading."""
