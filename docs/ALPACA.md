@@ -78,6 +78,52 @@ If you see that after what looked like a clean exit, the previous server is stil
 alive — most likely wedged in a `CloseDevice` call on the way out. Check for it
 before starting a new one, because the relay latches are still its to clear.
 
+### Stopping the server
+
+**The K8055 latches its outputs in hardware.** Closing the device does not clear
+them, and neither does exiting. A server that dies without running its shutdown
+path leaves a motor energised and the shutter driving with nothing watching it.
+That is the difference between the ways of stopping it:
+
+| How you stop it | Caught? | What happens |
+|---|---|---|
+| Ctrl-C | yes | `KeyboardInterrupt` unwinds `main()`; board released. |
+| `kill` / SIGTERM (POSIX) | yes | Handler raises `SystemExit`; same path. |
+| Ctrl-Break (Windows) | yes | SIGBREAK; same path. |
+| Closing the console window (Windows) | **no** | ~5 s, then the process dies with the relays hot. |
+| `taskkill /F`, `kill -9`, power loss | **never** | Nothing runs. Relays stay as they were. |
+
+A clean stop logs, in this order:
+
+```
+==SIGNAL== SIGTERM received; stopping the dome.
+Disconnected from dome hardware
+==SHUTDOWN== Dome server stopped.
+```
+
+If the middle line is missing, the board was never released — treat the dome as
+possibly still driving and check it.
+
+A **second** SIGTERM kills the process outright: the first one restores the
+default handler on its way past. That is deliberate. Releasing the board can
+block inside the K8055 DLL, and an operator who has decided this process must
+die now needs a way to say so that does not depend on the DLL answering.
+
+Two gaps remain, both Windows-only and neither fixable in `signal`:
+
+* Windows delivers no SIGTERM. `os.kill(pid, SIGTERM)` and `taskkill /F` both
+  become `TerminateProcess`, which no handler can intercept. Ctrl-C and
+  Ctrl-Break are the covered ways to stop it there.
+* The console window's close button raises `CTRL_CLOSE_EVENT`, which Python does
+  not surface as a signal at all. Covering it needs `SetConsoleCtrlHandler`
+  through `ctypes`. **Until that exists, do not stop the server by closing its
+  window** — Ctrl-C in the window instead.
+
+`Dome_Control` also installs handlers of its own, but only when constructed on
+the main thread. Here the board is opened from a WSGI worker thread the first
+time a client sets `Connected = true`, so that path always takes its early
+return: `device/app.py` holds the only signal handlers this server has.
+
 ## ASCOM member mapping
 
 A clamshell has no azimuth, no home position and no park position, so a large
@@ -318,6 +364,12 @@ layer inherited from the AlpycaDevice sample:
 ## Not yet done
 
 * Conform has only been run against the **simulator**; see the checklist.
-* No Windows service packaging yet (NSSM or similar).
+* No Windows service packaging yet (NSSM or similar). Note that a service stop
+  arrives as neither a signal nor a console event, so packaging one means
+  wiring its stop request into the same shutdown path — see *Stopping the
+  server*.
+* `SetConsoleCtrlHandler`, so closing the console window on Windows releases the
+  board instead of leaving the relays hot. The signal handlers cannot reach that
+  event; see *Stopping the server*.
 * `SlewToAltitude`, pending calibration.
 * The close seat-delay (checklist item 4), if the real dome shows it is needed.

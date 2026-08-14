@@ -8,6 +8,7 @@
 # and refuses to start while another process holds the K8055.
 # -----------------------------------------------------------------------------
 import inspect
+import signal
 import socket
 import sys
 import traceback
@@ -53,6 +54,60 @@ def acquire_single_instance_lock() -> bool:
         return False
     _instance_guard = guard
     return True
+
+
+# The K8055 holds its output latches in hardware. A process that dies without
+# clearing them leaves a motor energised and the shutter driving with nothing
+# supervising it, so every exit path that CAN be caught must be.
+#
+# Ctrl-C was always covered: Python's default SIGINT handler raises
+# KeyboardInterrupt, which unwinds through main()'s finally. SIGTERM was not --
+# its default action terminates the process outright, running neither that
+# finally nor atexit.
+#
+# Dome_Control installs handlers of its own, but signal.signal() is legal only on
+# the main thread and it says so (dome_shutter.py, _install_exit_hooks). On this
+# server the board is opened from a WSGI worker thread, the first time a client
+# sets Connected = true, so that path always takes the early return and leaves
+# only its atexit hook -- which SIGTERM does not run either. These are therefore
+# the only signal handlers the Alpaca server has.
+_shutdown_signal = None
+
+
+def _signal_shutdown(signum, frame):
+    """Unwind main() so its finally block de-energises the dome."""
+    global _shutdown_signal
+    _shutdown_signal = signum
+    # A second signal kills us outright. Releasing the board can block inside the
+    # K8055 DLL, and an operator who has decided this process must die now needs
+    # a way to say so that does not depend on the DLL answering.
+    signal.signal(signum, signal.SIG_DFL)
+    # Raised on the main thread at the point of interruption -- inside
+    # serve_forever()'s select -- so it propagates exactly as KeyboardInterrupt
+    # already does. Do NOT call httpd.shutdown() here: it waits on the
+    # serve_forever loop that this very thread is running, and would deadlock.
+    sys.exit(128 + signum)
+
+
+def install_signal_handlers() -> list:
+    """Install the shutdown handlers. Returns the signal names actually caught.
+
+    Call from the main thread. SIGBREAK is Windows' Ctrl-Break and does not
+    exist elsewhere; SIGTERM exists everywhere but is only really delivered on
+    POSIX -- see the shutdown notes in docs/ALPACA.md for what remains
+    uncatchable on Windows.
+    """
+    installed = []
+    for signame in ('SIGTERM', 'SIGBREAK'):
+        sig = getattr(signal, signame, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _signal_shutdown)
+        except (ValueError, OSError):
+            continue                # not supported here, or not the main thread
+        installed.append(signame)
+    return installed
 
 
 class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
@@ -211,6 +266,20 @@ def main():
 
     sys.excepthook = custom_excepthook
 
+    installed = install_signal_handlers()
+    if 'SIGTERM' not in installed:
+        logger.warning('==SIGNALS== No SIGTERM handler could be installed. A '
+                       'kill will terminate this process without de-energising '
+                       'the motors; stop the server with Ctrl-C instead.')
+    elif sys.platform == 'win32':
+        # Installing the handler succeeds here and buys nothing: Windows has no
+        # SIGTERM to deliver. Say so, rather than let a silent startup imply a
+        # cover that is not there.
+        logger.warning('==SIGNALS== Windows delivers no SIGTERM, and closing '
+                       'this console window cannot be caught at all -- either '
+                       'leaves the K8055 relays energised. Stop the server with '
+                       'Ctrl-C or Ctrl-Break.')
+
     # Discovery is a convenience: it lets clients find us without being told an
     # address. Losing it must NOT stop the dome from being controllable, so a
     # bind failure (another Alpaca driver, ASCOM Remote, or Docker already
@@ -243,6 +312,11 @@ def main():
                         f'{Config.ip_address}:{Config.port}. Time stamps are UTC.')
             httpd.serve_forever()
     finally:
+        # Logged before the de-energise, not after: if releasing the board wedges
+        # in the DLL, the log still says what asked the server to stop.
+        if _shutdown_signal is not None:
+            logger.info(f'==SIGNAL== {signal.Signals(_shutdown_signal).name} '
+                        f'received; stopping the dome.')
         # Whatever brings the server down, the motors must not be left running.
         # GreenhillDome.disconnect() is idempotent and safe when never connected.
         try:
