@@ -186,19 +186,26 @@ def falcon_uncaught_exception_handler(req: Request, resp: Response,
 
 
 def main():
+    # The guard comes FIRST, before the logger, and reports to stderr rather
+    # than to the log. init_logging() rotates alpyca.log, and rotating means
+    # renaming a file the incumbent still has open: on Windows that rename
+    # raises, so startup died with an unexplained log-file error instead of the
+    # message below, and on Linux it silently succeeded and moved the running
+    # server's log out from under it. Neither is a thing to do to a process that
+    # is at that moment driving a shutter.
+    if not acquire_single_instance_lock():
+        print('==STARTUP FAILED== Another instance of the dome server (or '
+              'the legacy PySide6 app) already owns the K8055. Two '
+              'processes writing the same relay outputs is unsafe; '
+              'refusing to start.', file=sys.stderr)
+        sys.exit(1)
+
     logger = log.init_logging()
     log.logger = logger
     exceptions.logger = logger
     discovery.logger = logger
     dome.logger = logger
     set_shr_logger(logger)
-
-    if not acquire_single_instance_lock():
-        logger.error('==STARTUP FAILED== Another instance of the dome server (or '
-                     'the legacy PySide6 app) already owns the K8055. Two '
-                     'processes writing the same relay outputs is unsafe; '
-                     'refusing to start.')
-        sys.exit(1)
 
     dome.start_dome_device(logger)
 

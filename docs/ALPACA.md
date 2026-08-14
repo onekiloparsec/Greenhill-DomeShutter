@@ -21,9 +21,10 @@ could move it.
 | `device/simulate.py` | Runs the server against the simulator. |
 
 Vendored unchanged from AlpycaDevice: `shr.py`, `exceptions.py`, `discovery.py`,
-`log.py`, `setup.py`. Modified: `config.py` (calibration section; config path
+`setup.py`. Modified: `config.py` (calibration section; config path
 resolved relative to the module so a Windows service can find it),
-`management.py` (points at `DomeMetadata`).
+`log.py` (log path likewise; no log-file problem may prevent startup —
+see below), `management.py` (points at `DomeMetadata`).
 
 ## Running
 
@@ -49,6 +50,33 @@ for discovery by address and UDP broadcast on 32227 for automatic discovery.
 **Only one process may own the K8055.** The server binds a loopback port as a
 mutex and refuses to start if another instance holds it. It cannot detect the
 legacy PySide6 app, which opens the board directly — do not run both.
+
+### The log, and restarting
+
+`device/alpyca.log`, always beside `log.py` and never in the launch directory.
+Each run rotates the last one to `.1`, keeping ten generations. Set `ALPYCA_LOG`
+to put it elsewhere.
+
+Nothing about the log file can stop the dome from being served. A log directory
+that cannot be written falls back to the console; a rotation that cannot rename
+appends to the existing file instead. Both print a `==LOGGING==` line to stderr
+and carry on.
+
+This matters on restart. Rotating means renaming a file the previous process may
+still have open, which Windows refuses outright — so a start that followed a
+crash or an interrupt used to die with a log-file error, and the operator was
+left with an Alpaca-unreachable dome and a file to go and delete. Note what that
+error was really telling you: **a log file still held open means a process still
+holding it, and that process still owns the board.** The single-instance guard is
+therefore checked first, before the logger exists, and says so plainly on stderr:
+
+```
+==STARTUP FAILED== Another instance of the dome server ... already owns the K8055.
+```
+
+If you see that after what looked like a clean exit, the previous server is still
+alive — most likely wedged in a `CloseDevice` call on the way out. Check for it
+before starting a new one, because the relay latches are still its to clear.
 
 ## ASCOM member mapping
 
