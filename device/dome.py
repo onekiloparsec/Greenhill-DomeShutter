@@ -80,19 +80,59 @@ def start_dome_device(logger: Logger):
 # --------------------
 # SHARED RESPONDER BITS
 # --------------------
+def _client_id(req: Request) -> str:
+    """The caller's Alpaca ClientID.
+
+    Must go through get_request_field, NOT req.params. Alpaca carries the field
+    in the query string on a GET and in the form body on a PUT, and
+    PreProcessRequest overwrites req.params['ClientID'] with its '0' default
+    whenever it is absent from where it looked. Reading req.params directly
+    therefore lumps every PUT in the world together under client '0' -- so a
+    client would connect as '0' and then read Connected as itself, and never
+    see itself connected at all.
+    """
+    client = str(get_request_field('ClientID', req, True, '0'))
+    if client != '0':
+        return client
+
+    # Fall back to the raw query string. Alpaca puts PUT parameters in the body
+    # and every client here does exactly that, so this is belt and braces -- but
+    # cheap belt and braces, because the failure it guards against is silent:
+    # a client that sent ClientID in the URL of a PUT would connect as '0' and
+    # then read Connected as itself, never seeing itself connected, with nothing
+    # anywhere reporting an error. req.query_string is used rather than
+    # req.params because PreProcessRequest overwrites req.params['ClientID']
+    # with '0' when it fails to find the field where it looked.
+    for pair in (req.query_string or '').split('&'):
+        key, _, value = pair.partition('=')
+        if key.lower() == 'clientid' and value:
+            return value
+    return '0'
+
+
 def _not_connected(req: Request, resp: Response) -> bool:
     """
     Emit the standard NotConnected response and report whether it was emitted.
     Uses the response type matching the HTTP method: a PUT must come back as a
     MethodResponse, not a PropertyResponse.
+
+    Connection is PER CLIENT. Another client holding the board open does not
+    make this caller connected -- and, more to the point, this caller going
+    away does not disconnect that one.
     """
-    if dome_dev is None or not dome_dev.connected:
+    client = _client_id(req)
+    if dome_dev is None or not dome_dev.is_connected(client):
         err = NotConnectedException()
         if req.method == 'PUT':
             resp.text = MethodResponse(req, err).json
         else:
             resp.text = PropertyResponse(None, req, err).json
         return True
+    # Every authenticated request is proof of life. Without this a client that
+    # polls steadily but never re-sets Connected would eventually be expired as
+    # silent and find itself disconnected mid-night.
+    dome_dev.clients.touch(client)
+    dome_dev.sweep_clients()
     return False
 
 
@@ -153,7 +193,7 @@ class connect:
     it synchronously, so Connecting is never True."""
     def on_put(self, req: Request, resp: Response, devnum: int):
         try:
-            dome_dev.connect()
+            dome_dev.connect(_client_id(req))
             resp.text = MethodResponse(req).json
         except Exception as ex:
             resp.text = MethodResponse(
@@ -164,7 +204,7 @@ class connect:
 class disconnect:
     def on_put(self, req: Request, resp: Response, devnum: int):
         try:
-            dome_dev.disconnect()
+            dome_dev.disconnect(_client_id(req))
             resp.text = MethodResponse(req).json
         except Exception as ex:
             resp.text = MethodResponse(
@@ -180,19 +220,25 @@ class connecting:
 @before(PreProcessRequest(maxdev))
 class connected:
     def on_get(self, req: Request, resp: Response, devnum: int):
-        resp.text = PropertyResponse(dome_dev.connected, req).json
+        resp.text = PropertyResponse(
+            dome_dev.is_connected(_client_id(req)), req).json
 
     def on_put(self, req: Request, resp: Response, devnum: int):
         conn_str = get_request_field('Connected', req)
         conn = to_bool(conn_str)                        # 400 if not a bool
+        client = _client_id(req)
         try:
             if conn:
-                dome_dev.connect()
+                dome_dev.connect(client)
             else:
-                # Disconnecting de-energises the motors. That is deliberate: a
-                # client dropping the connection must not leave a shell running
-                # with nothing watching the limit switches.
-                dome_dev.disconnect()
+                # Disconnecting de-energises the motors -- but only once the
+                # LAST client has gone. The rule being protected is that a
+                # shell must never be left running with nobody watching, and
+                # that is satisfied while anyone is still connected. Releasing
+                # the board because one of two clients let go would let either
+                # of them stop the other's close, which is the opposite of
+                # safe.
+                dome_dev.disconnect(client)
             resp.text = MethodResponse(req).json
         except Exception as ex:
             resp.text = MethodResponse(

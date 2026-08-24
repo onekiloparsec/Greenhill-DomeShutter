@@ -324,10 +324,13 @@ def main():
             logger.info(f'==SIGNAL== {signal.Signals(_shutdown_signal).name} '
                         f'received; stopping the dome.')
         # Whatever brings the server down, the motors must not be left running.
-        # GreenhillDome.disconnect() is idempotent and safe when never connected.
+        # shutdown() releases the board regardless of who is still registered as
+        # connected -- unlike disconnect(), which waits for the last client. The
+        # process is going away either way, so there is nobody left to watch.
+        # Idempotent and safe when never connected.
         try:
             if dome.dome_dev is not None:
-                dome.dome_dev.disconnect()
+                dome.dome_dev.shutdown()
         except Exception as ex:
             logger.error(f'Error de-energising the dome during shutdown: {ex}')
         logger.info('==SHUTDOWN== Dome server stopped.')

@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import threading
+import time
 from enum import IntEnum
 
 # dome_shutter.py lives at the repository root, one level above this package.
@@ -61,45 +62,191 @@ class ActionError(Exception):
     """A vendor Action was called with something the device cannot honour."""
 
 
+# How long a connected client may go unheard before it is presumed gone.
+#
+# Alpaca is stateless HTTP, so a client that crashes never says goodbye. Without
+# an expiry its entry would pin the board open forever, and "the last client has
+# disconnected" -- the condition that de-energises the motors -- would never
+# again be true.
+#
+# Five minutes is comfortably longer than any client's polling interval here:
+# Arcsecond reads state every 30 s and the weather service watches the shutter
+# every 2 s while closing.
+CLIENT_TIMEOUT_SECONDS = 300.0
+
+
+class ClientRegistry:
+    """Who is connected, tracked per Alpaca ClientID.
+
+    ASCOM's `Connected` is one property, but Alpaca serves many clients at once
+    and this dome now has two: Arcsecond, and the weather service that closes it
+    on bad weather. Sharing a single flag between them means either one setting
+    it false de-energises the motors under the other -- possibly mid-close,
+    which is the one moment that must not happen.
+
+    So each client gets its own connection state, and the hardware is released
+    only when the LAST of them lets go. That preserves the original rule -- a
+    client dropping its connection must not leave a shell running with nobody
+    watching -- while making it impossible for one client to disarm another.
+
+    Expiry is not optional here. The Python Alpaca client library picks its
+    ClientID with `random.randint(0, 65535)` at import, so Arcsecond presents a
+    fresh identity after every restart and one per Celery worker. Entries left
+    by the old identities would accumulate and the board would never be
+    released.
+    """
+
+    def __init__(self, timeout=CLIENT_TIMEOUT_SECONDS, clock=time.monotonic):
+        self._timeout = timeout
+        self._clock = clock
+        self._seen = {}                 # client id -> last heard from
+        self._lock = threading.Lock()
+
+    def connect(self, client_id):
+        """Register a client. True if this is the one that opened the door."""
+        with self._lock:
+            self._expire()
+            first = not self._seen
+            self._seen[client_id] = self._clock()
+            return first
+
+    def disconnect(self, client_id):
+        """Drop a client. True if this was the last one out."""
+        with self._lock:
+            self._seen.pop(client_id, None)
+            self._expire()
+            return not self._seen
+
+    def is_connected(self, client_id):
+        with self._lock:
+            self._expire()
+            if client_id not in self._seen:
+                return False
+            self._seen[client_id] = self._clock()        # still alive
+            return True
+
+    def touch(self, client_id):
+        """Refresh a client we already know about.
+
+        Only refreshes an EXISTING entry. A stray `GET name` from a discovery
+        probe must not enrol its sender as a connected client.
+        """
+        with self._lock:
+            self._expire()
+            if client_id in self._seen:
+                self._seen[client_id] = self._clock()
+
+    def sweep(self):
+        """Expire the silent. True if that emptied the registry."""
+        with self._lock:
+            had = bool(self._seen)
+            self._expire()
+            return had and not self._seen
+
+    def _expire(self):
+        """Caller holds the lock."""
+        cutoff = self._clock() - self._timeout
+        for client_id in [c for c, seen in self._seen.items() if seen < cutoff]:
+            del self._seen[client_id]
+
+    @property
+    def clients(self):
+        with self._lock:
+            return sorted(self._seen)
+
+    @property
+    def count(self):
+        with self._lock:
+            return len(self._seen)
+
+
 class GreenhillDome:
     """
     Wraps Dome_Control with connect/disconnect semantics and the ASCOM state
     collapse. One instance per served device.
     """
 
-    def __init__(self, calibration=None, logger=None):
+    def __init__(self, calibration=None, logger=None, clients=None):
         self._calibration = calibration or {}
         self._logger = logger
         self._dome = None
         self._lock = threading.Lock()
+        self._clients = clients if clients is not None else ClientRegistry()
 
     # ------------------------------------------------------------------ #
     # Connection                                                         #
     # ------------------------------------------------------------------ #
 
     @property
-    def connected(self):
+    def clients(self):
+        return self._clients
+
+    @property
+    def hardware_open(self):
+        """Whether the board is held, regardless of who is connected."""
         return self._dome is not None
 
-    def connect(self):
+    def is_connected(self, client_id):
+        """ASCOM `Connected`, as seen by ONE client.
+
+        A client that never connected reads false even while another client
+        holds the board open -- which is what makes the two independent.
         """
-        Open the board. Dome_Control acquires the K8055 and starts its
-        supervision thread in its constructor, so construction IS connection.
+        return self._clients.is_connected(client_id) and self._dome is not None
+
+    def connect(self, client_id):
         """
+        Open the board for this client. Dome_Control acquires the K8055 and
+        starts its supervision thread in its constructor, so construction IS
+        connection -- but only the first client causes it.
+        """
+        first = self._clients.connect(client_id)
         with self._lock:
             if self._dome is not None:
+                if first:
+                    self._log(f'Client {client_id} connected; board already open')
+                else:
+                    self._log(f'Client {client_id} connected '
+                              f'({self._clients.count} now connected)')
                 return
             self._dome = Dome_Control(calibration=self._calibration)
-            self._log(f'Connected to dome hardware; calibration={self._calibration}')
+            self._log(f'Connected to dome hardware for client {client_id}; '
+                      f'calibration={self._calibration}')
 
-    def disconnect(self):
-        """De-energise the motors, stop supervision and release the board."""
+    def disconnect(self, client_id):
+        """Drop this client. The board is released only by the last one.
+
+        De-energising the motors when a client goes is deliberate -- a shell
+        must not be left running with nobody watching -- but "a client" is not
+        "every client". While anyone is still connected the dome keeps running,
+        so one client stopping cannot interrupt another client's close.
+        """
+        last = self._clients.disconnect(client_id)
+        if not last:
+            self._log(f'Client {client_id} disconnected; '
+                      f'{self._clients.count} still connected, board stays open')
+            return
+        self._release('last client ({}) disconnected'.format(client_id))
+
+    def sweep_clients(self):
+        """Expire clients that have gone silent, releasing the board if that
+        was the last of them. Called from the responders, so a vanished client
+        cannot pin the hardware open indefinitely."""
+        if self._clients.sweep():
+            self._release('all clients went silent')
+
+    def shutdown(self):
+        """Unconditional release, for server shutdown. Ignores who is
+        connected: the process is going away regardless."""
+        self._release('server shutting down')
+
+    def _release(self, why):
         with self._lock:
             if self._dome is None:
                 return
             dome, self._dome = self._dome, None
         dome.shutdown()
-        self._log('Disconnected from dome hardware')
+        self._log(f'Disconnected from dome hardware ({why})')
 
     def _require(self):
         dome = self._dome

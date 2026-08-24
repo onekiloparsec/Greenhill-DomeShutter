@@ -143,8 +143,54 @@ part of `IDome` is honestly unsupported rather than faked.
 | `OpenShutter` | both shells, staggered | |
 | `CloseShutter` | both shells, **west first** | The telescope parks west, so that shell must clear the OTA first. |
 | `AbortSlew` | stops both immediately | |
-| `Connected` / `Connect` / `Disconnect` | opens/releases the board | Disconnecting **de-energises the motors**: a client dropping its connection must not leave a shell running unsupervised. |
+| `Connected` / `Connect` / `Disconnect` | **per client**, see below | The board is released, and the motors de-energised, only when the LAST client disconnects. |
 | `InterfaceVersion` | `3` | IDomeV3, ASCOM Platform 7. `DeviceState` implemented. |
+
+### Connection is per client
+
+ASCOM has one `Connected` property. Alpaca serves many clients at once, and
+this dome now has two: Arcsecond, and the Greenhill weather service that closes
+it in bad weather.
+
+A single shared flag meant either one setting `Connected = false` would
+de-energise the motors under the other — **possibly mid-close**, which is the
+one moment that must not happen. So each ClientID gets its own connection
+state, and the hardware is released only when the last of them lets go.
+
+That keeps the original rule intact: a shell must never be left running with
+nobody watching. It just recognises that "a client went away" and "everyone
+went away" are different events.
+
+```
+Arcsecond connects       -> board opens
+weather service connects -> board already open, two clients registered
+Arcsecond disconnects    -> board STAYS OPEN, weather service unaffected
+weather service disconnects -> last one out; motors de-energised, board released
+```
+
+A client that never connected is refused with `NotConnected`, as before.
+
+**Clients expire after five minutes of silence.** Alpaca is stateless HTTP, so
+a client that crashes never says goodbye, and its entry would otherwise pin the
+board open forever — making "the last client disconnected" permanently false.
+This matters more than it sounds: the Python Alpaca client library picks its
+ClientID with `random.randint(0, 65535)` at import, so Arcsecond presents a
+fresh identity after every restart and one per Celery worker. Any authenticated
+request from a registered client counts as proof of life; a request from an
+unregistered one does not enrol it.
+
+Both clients here poll far faster than the timeout — Arcsecond every 30 s, the
+weather service every 2 s while closing.
+
+**`ClientID` must be read with `get_request_field`, not `req.params`.** Alpaca
+carries it in the query string on a GET and in the form body on a PUT, and
+`PreProcessRequest` overwrites `req.params['ClientID']` with its `'0'` default
+whenever it fails to find the field. Reading `req.params` directly lumps every
+PUT together under client `'0'` — so a client would connect as `'0'`, then read
+`Connected` as itself, and never see itself connected, with nothing reporting an
+error. There is a query-string fallback for clients that put the field in the
+URL of a PUT, which the spec does not ask for but which fails silently if
+unhandled.
 
 ### ShutterStatus: two shells, one state
 

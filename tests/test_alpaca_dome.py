@@ -126,8 +126,9 @@ def client(board):
     falc_app = falcon.App()
     device_app.init_routes(falc_app, 'dome', dome_module)
     yield testing.TestClient(falc_app)
-    if dome_module.dome_dev.connected:
-        dome_module.dome_dev.disconnect()
+    # shutdown(), not disconnect(): the latter now waits for the LAST client to
+    # let go, and the test may have connected under any ClientID.
+    dome_module.dome_dev.shutdown()
 
 
 def get(client, attr, **params):
@@ -137,9 +138,15 @@ def get(client, attr, **params):
 
 
 def put(client, attr, **body):
+    # ClientID goes in the BODY of a PUT, which is where Alpaca puts it and
+    # where every real client puts it. It used to be passed as a query
+    # parameter here, which the server does not read for a PUT -- harmless
+    # while Connected was one global flag, and not harmless once connection
+    # state became per client.
+    fields = {'ClientID': '1', 'ClientTransactionID': '1'}
+    fields.update(body)
     return client.simulate_put(f'/api/v1/dome/0/{attr}',
-                               params={'ClientID': '1', 'ClientTransactionID': '1'},
-                               body='&'.join(f'{k}={v}' for k, v in body.items()),
+                               body='&'.join(f'{k}={v}' for k, v in fields.items()),
                                headers={'Content-Type':
                                         'application/x-www-form-urlencoded'}).json
 
@@ -327,8 +334,7 @@ class TestUncaughtResponderException:
         device_log.logger = quiet
 
         class BrokenDevice:
-            @property
-            def connected(self):
+            def is_connected(self, client_id):
                 raise RuntimeError('simulated driver fault')
 
         previous = dome_module.dome_dev
@@ -357,3 +363,179 @@ class TestUncaughtResponderException:
                 '/api/v1/dome/0/connected',
                 params={'ClientID': '1', 'ClientTransactionID': '1'})
         assert 'simulated driver fault' in caplog.text
+
+
+# --- two clients, two connections ------------------------------------------
+
+def put_as(client, attr, client_id, **body):
+    fields = {'ClientID': client_id, 'ClientTransactionID': '1'}
+    fields.update(body)
+    return client.simulate_put(f'/api/v1/dome/0/{attr}',
+                               body='&'.join(f'{k}={v}' for k, v in fields.items()),
+                               headers={'Content-Type':
+                                        'application/x-www-form-urlencoded'}).json
+
+
+def get_as(client, attr, client_id, **params):
+    return client.simulate_get(f'/api/v1/dome/0/{attr}',
+                               params={'ClientID': client_id,
+                                       'ClientTransactionID': '1', **params}).json
+
+
+class TestPerClientConnection:
+    """ASCOM has one `Connected` property; Alpaca serves many clients.
+
+    This dome now has two: Arcsecond, and the weather service that closes it in
+    bad weather. Sharing one flag between them meant either could de-energise
+    the motors under the other -- possibly mid-close, which is the one moment
+    it must not happen.
+    """
+
+    ARCSECOND = '4242'
+    WEATHER = '1782'
+
+    def test_connecting_one_client_does_not_connect_the_other(self, client):
+        put_as(client, 'connected', self.ARCSECOND, Connected='true')
+        assert get_as(client, 'connected', self.ARCSECOND)['Value'] is True
+        assert get_as(client, 'connected', self.WEATHER)['Value'] is False
+
+    def test_one_client_disconnecting_leaves_the_other_connected(self, client, board):
+        put_as(client, 'connected', self.ARCSECOND, Connected='true')
+        put_as(client, 'connected', self.WEATHER, Connected='true')
+
+        put_as(client, 'connected', self.ARCSECOND, Connected='false')
+
+        assert get_as(client, 'connected', self.ARCSECOND)['Value'] is False
+        assert get_as(client, 'connected', self.WEATHER)['Value'] is True
+
+    def test_the_board_stays_open_while_anyone_is_connected(self, client,
+                                                            board):
+        # The point of the whole exercise. Arcsecond going away must not
+        # de-energise the motors while the weather service is mid-close.
+        import dome as dome_module
+        put_as(client, 'connected', self.ARCSECOND, Connected='true')
+        put_as(client, 'connected', self.WEATHER, Connected='true')
+        assert dome_module.dome_dev.hardware_open is True
+
+        put_as(client, 'connected', self.ARCSECOND, Connected='false')
+        assert dome_module.dome_dev.hardware_open is True
+
+    def test_the_last_client_out_releases_the_board(self, client, board):
+        # And the original rule still holds: a shell must never be left running
+        # with nobody watching.
+        import dome as dome_module
+        put_as(client, 'connected', self.ARCSECOND, Connected='true')
+        put_as(client, 'connected', self.WEATHER, Connected='true')
+        put_as(client, 'connected', self.ARCSECOND, Connected='false')
+        put_as(client, 'connected', self.WEATHER, Connected='false')
+        assert dome_module.dome_dev.hardware_open is False
+
+    def test_a_disconnected_client_cannot_command_the_dome(self, client, board):
+        put_as(client, 'connected', self.ARCSECOND, Connected='true')
+        result = put_as(client, 'closeshutter', self.WEATHER)
+        assert result['ErrorNumber'] == ERR_NOT_CONNECTED
+
+    def test_platform7_connect_and_disconnect_are_also_per_client(self, client,
+                                                                  board):
+        put_as(client, 'connect', self.ARCSECOND)
+        put_as(client, 'connect', self.WEATHER)
+        put_as(client, 'disconnect', self.ARCSECOND)
+        assert get_as(client, 'connected', self.ARCSECOND)['Value'] is False
+        assert get_as(client, 'connected', self.WEATHER)['Value'] is True
+
+    def test_client_id_is_read_from_a_put_body(self, client, board):
+        # Where Alpaca puts it, and where alpyca and our own client put it.
+        import dome as dome_module
+        put_as(client, 'connected', self.WEATHER, Connected='true')
+        assert self.WEATHER in dome_module.dome_dev.clients.clients
+
+    def test_client_id_in_a_put_query_string_is_still_honoured(self, client,
+                                                              board):
+        # Not where the spec puts it, but the failure would be silent: such a
+        # client would connect as '0' and then never see itself connected.
+        import dome as dome_module
+        client.simulate_put(
+            '/api/v1/dome/0/connected',
+            params={'ClientID': '9911', 'ClientTransactionID': '1'},
+            body='Connected=true',
+            headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        assert '9911' in dome_module.dome_dev.clients.clients
+
+
+class TestClientExpiry:
+    """A client that crashes never says goodbye.
+
+    The Python Alpaca library picks its ClientID with random.randint at import,
+    so Arcsecond presents a fresh identity after every restart, and one per
+    Celery worker. Without expiry those entries accumulate and "the last client
+    disconnected" -- the condition that de-energises the motors -- never becomes
+    true again.
+    """
+
+    def registry(self, timeout=300.0):
+        from domedevice import ClientRegistry
+        clock = {'now': 0.0}
+
+        class Clock:
+            def __call__(self): return clock['now']
+
+        registry = ClientRegistry(timeout=timeout, clock=Clock())
+        return registry, clock
+
+    def test_a_silent_client_expires(self):
+        registry, clock = self.registry(timeout=100.0)
+        registry.connect('a')
+        clock['now'] = 150.0
+        assert registry.is_connected('a') is False
+
+    def test_a_polling_client_does_not(self):
+        registry, clock = self.registry(timeout=100.0)
+        registry.connect('a')
+        for step in range(1, 10):
+            clock['now'] = step * 50.0
+            assert registry.is_connected('a') is True
+
+    def test_touch_does_not_enrol_a_stranger(self):
+        # A discovery probe reading `name` must not become a connected client.
+        registry, _ = self.registry()
+        registry.touch('passer-by')
+        assert registry.clients == []
+
+    def test_sweep_reports_when_the_last_client_expires(self):
+        registry, clock = self.registry(timeout=100.0)
+        registry.connect('a')
+        assert registry.sweep() is False
+        clock['now'] = 150.0
+        assert registry.sweep() is True
+        assert registry.sweep() is False        # only once
+
+    def test_expiry_releases_the_board(self, board):
+        from domedevice import ClientRegistry, GreenhillDome
+        clock = {'now': 0.0}
+
+        class Clock:
+            def __call__(self): return clock['now']
+
+        dome = GreenhillDome(calibration=None, logger=None,
+                             clients=ClientRegistry(timeout=100.0, clock=Clock()))
+        dome.connect('a')
+        assert dome.hardware_open is True
+        clock['now'] = 150.0
+        dome.sweep_clients()
+        assert dome.hardware_open is False
+
+    def test_a_restarted_client_under_a_new_id_does_not_pin_the_board(self, board):
+        # Exactly what happens when a Celery worker restarts.
+        from domedevice import ClientRegistry, GreenhillDome
+        clock = {'now': 0.0}
+
+        class Clock:
+            def __call__(self): return clock['now']
+
+        dome = GreenhillDome(calibration=None, logger=None,
+                             clients=ClientRegistry(timeout=100.0, clock=Clock()))
+        for generation, client_id in enumerate(('old', 'newer', 'newest')):
+            clock['now'] = generation * 200.0
+            dome.connect(client_id)
+            dome.sweep_clients()
+        assert dome.clients.clients == ['newest']
