@@ -11,6 +11,7 @@ import inspect
 import signal
 import socket
 import sys
+import time
 import traceback
 from enum import IntEnum
 from socketserver import ThreadingMixIn
@@ -32,28 +33,58 @@ API_VERSION = 1
 
 # Only ONE process may own the K8055 at a time. Two writers to the same output
 # register, with no lock between them, is how you get a motor energised by one
-# process and believed stopped by the other. The legacy PySide6 app opens the
-# board directly, so this server must refuse to start alongside it.
+# process and believed stopped by the other. The guard can only see other
+# holders of this port, i.e. other instances of this server; the legacy local
+# app opens the board directly and is invisible to it -- do not run both.
+#
+# 50815 is a family convention: Greenhill-RainMon documents 50816 (broadcaster)
+# and 50817 (weather device server) around it. Keep them distinct and in sync.
 _SINGLE_INSTANCE_PORT = 50815
 _instance_guard = None
 
+# How long a start will wait for the port before giving up. A restart typed the
+# moment the old server was interrupted lands while that server is still
+# releasing the board -- the monitor join alone is allowed 5 s, and the K8055
+# DLL calls after it take what they take. Refusing instantly turns that race
+# into a startup failure; waiting a bounded moment turns it into a clean start.
+# A genuinely running server keeps the port for its whole life, so after the
+# grace the refusal below is real.
+_GUARD_GRACE_SECONDS = 10.0
+_GUARD_POLL_SECONDS = 0.25
 
-def acquire_single_instance_lock() -> bool:
+
+def acquire_single_instance_lock(grace_seconds=0.0) -> bool:
     """
     Bind a loopback port as a process-wide mutex. Chosen over a lock file
     because the OS releases it even if we are killed with SIGKILL, where a stale
     lock file would block every subsequent start.
+
+    :param grace_seconds: how long to keep retrying a failed bind before
+        reporting defeat, for the restart-races-the-dying-incumbent case.
+        The wait is announced on stderr once; 0 means a single attempt.
     """
     global _instance_guard
-    guard = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        guard.bind(('127.0.0.1', _SINGLE_INSTANCE_PORT))
-        guard.listen(1)
-    except OSError:
-        guard.close()
-        return False
-    _instance_guard = guard
-    return True
+    deadline = time.monotonic() + grace_seconds
+    announced = False
+    while True:
+        guard = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            guard.bind(('127.0.0.1', _SINGLE_INSTANCE_PORT))
+            guard.listen(1)
+        except OSError:
+            guard.close()
+            if time.monotonic() >= deadline:
+                return False
+            if not announced:
+                announced = True
+                print(f'==STARTUP== The K8055 owner port is still held -- a '
+                      f'previous dome server may still be shutting down. '
+                      f'Waiting up to {grace_seconds:.0f} s for it to let go.',
+                      file=sys.stderr)
+            time.sleep(_GUARD_POLL_SECONDS)
+            continue
+        _instance_guard = guard
+        return True
 
 
 # The K8055 holds its output latches in hardware. A process that dies without
@@ -108,6 +139,29 @@ def install_signal_handlers() -> list:
             continue                # not supported here, or not the main thread
         installed.append(signame)
     return installed
+
+
+def _restore_default_signal_handlers():
+    """Make any further Ctrl-C or kill terminate the process outright.
+
+    Called on the way INTO the shutdown path. From that point every remaining
+    handler is Python-level (the default SIGINT handler, or _signal_shutdown if
+    it never fired), and a Python-level handler only runs between bytecodes --
+    so while the main thread is wedged inside a K8055 DLL call, pressing Ctrl-C
+    again would do NOTHING, and the wedged process would sit on the
+    single-instance port forever, refusing every restart. SIG_DFL acts below
+    the interpreter and kills a wedged process too. _signal_shutdown makes the
+    same promise for a second SIGTERM; this extends it to the Ctrl-C path,
+    where no handler of ours ever ran.
+    """
+    for signame in ('SIGINT', 'SIGTERM', 'SIGBREAK'):
+        sig = getattr(signal, signame, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass                    # not supported here, or not the main thread
 
 
 class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
@@ -254,11 +308,15 @@ def main():
     # message below, and on Linux it silently succeeded and moved the running
     # server's log out from under it. Neither is a thing to do to a process that
     # is at that moment driving a shutter.
-    if not acquire_single_instance_lock():
-        print('==STARTUP FAILED== Another instance of the dome server (or '
-              'the legacy PySide6 app) already owns the K8055. Two '
-              'processes writing the same relay outputs is unsafe; '
-              'refusing to start.', file=sys.stderr)
+    if not acquire_single_instance_lock(grace_seconds=_GUARD_GRACE_SECONDS):
+        print('==STARTUP FAILED== Another instance of the dome server '
+              'already owns the K8055. Two processes writing the same relay '
+              'outputs is unsafe; refusing to start. If no other dome server '
+              'is running, the previous one is still alive but wedged '
+              'releasing the board: find the python process holding TCP port '
+              f'{_SINGLE_INSTANCE_PORT} and kill it, then start again '
+              '(see docs/ALPACA.md, "The log, and restarting").',
+              file=sys.stderr)
         sys.exit(1)
 
     logger = log.init_logging()
@@ -318,6 +376,11 @@ def main():
                         f'{Config.ip_address}:{Config.port}. Time stamps are UTC.')
             httpd.serve_forever()
     finally:
+        # From here on, a second Ctrl-C (or kill) must terminate us outright:
+        # the release below can wedge inside the K8055 DLL, where Python-level
+        # handlers never run and the process would squat the single-instance
+        # port until someone found it in the task manager.
+        _restore_default_signal_handlers()
         # Logged before the de-energise, not after: if releasing the board wedges
         # in the DLL, the log still says what asked the server to stop.
         if _shutdown_signal is not None:

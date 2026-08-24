@@ -11,6 +11,7 @@ the process died.
 """
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -131,3 +132,81 @@ def test_sigterm_releases_the_board_before_the_process_dies(tmp_path):
                   '==SHUTDOWN==')]
     assert all(p != -1 for p in positions), output
     assert positions == sorted(positions), output
+
+
+@pytest.mark.skipif(sys.platform == 'win32',
+                    reason='no deliverable SIGINT to a child process on Windows')
+def test_ctrl_c_then_immediate_restart_succeeds(tmp_path):
+    """The field incident: Ctrl-C the server, restart straight away, and be
+    told another instance owns the K8055. The restart must come up instead."""
+    environment = dict(os.environ, ALPYCA_LOG=str(tmp_path / 'alpyca.log'),
+                       PYTHONUNBUFFERED='1')
+    server = subprocess.Popen([sys.executable, 'simulate.py'], cwd=DEVICE_DIR,
+                              env=environment, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+    try:
+        _wait_for_startup(server, deadline=time.monotonic() + 30)
+        assert _put(11111, 'connected', 'Connected=True') == 200
+
+        server.send_signal(signal.SIGINT)             # Ctrl-C
+        output = server.communicate(timeout=30)[0]
+    finally:
+        if server.poll() is None:
+            server.kill()
+            server.communicate()
+
+    # Died BY SIGINT (the interpreter re-raises it), with the board released.
+    assert server.returncode == -signal.SIGINT, output
+    assert 'Disconnected from dome hardware' in output
+    assert '==SHUTDOWN==' in output
+
+    restarted = subprocess.Popen([sys.executable, 'simulate.py'],
+                                 cwd=DEVICE_DIR, env=environment,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True)
+    try:
+        # _wait_for_startup fails loudly, printing ==STARTUP FAILED== if the
+        # guard refused -- which is exactly the regression under test.
+        _wait_for_startup(restarted, deadline=time.monotonic() + 30)
+    finally:
+        if restarted.poll() is None:
+            restarted.send_signal(signal.SIGINT)
+            try:
+                restarted.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                restarted.kill()
+                restarted.communicate()
+
+
+def test_startup_waits_for_a_dying_incumbent(tmp_path):
+    """A restart that lands while the old process still holds the guard port
+    must wait it out, not refuse. Modelled by holding the port ourselves and
+    releasing it a moment after the new server starts asking."""
+    incumbent = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    incumbent.bind(('127.0.0.1', app._SINGLE_INSTANCE_PORT))
+    incumbent.listen(1)
+
+    environment = dict(os.environ, ALPYCA_LOG=str(tmp_path / 'alpyca.log'),
+                       PYTHONUNBUFFERED='1')
+    server = subprocess.Popen([sys.executable, 'simulate.py'], cwd=DEVICE_DIR,
+                              env=environment, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+    try:
+        # Held port: the server must be waiting, neither serving nor dead.
+        time.sleep(1.5)
+        assert server.poll() is None, server.communicate()[0]
+
+        incumbent.close()                             # the old instance exits
+        _wait_for_startup(server, deadline=time.monotonic() + 30)
+    finally:
+        incumbent.close()
+        if server.poll() is None:
+            server.terminate()
+        try:
+            output = server.communicate(timeout=15)[0]
+        except subprocess.TimeoutExpired:
+            server.kill()
+            output = server.communicate()[0]
+
+    assert 'previous dome server may still be shutting down' in output
+    assert '==STARTUP FAILED==' not in output

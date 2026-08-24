@@ -74,9 +74,14 @@ therefore checked first, before the logger exists, and says so plainly on stderr
 ==STARTUP FAILED== Another instance of the dome server ... already owns the K8055.
 ```
 
-If you see that after what looked like a clean exit, the previous server is still
-alive — most likely wedged in a `CloseDevice` call on the way out. Check for it
-before starting a new one, because the relay latches are still its to clear.
+A restart typed the moment the old server was interrupted lands while that
+server is still releasing the board — the monitor join alone is allowed 5 s.
+So a start that finds the port held does not refuse immediately: it says so on
+stderr and **waits up to 10 s** for the port to be released, then continues on
+its own. The refusal above only appears after that grace, and then it is real:
+the previous server is still alive — most likely wedged in a `CloseDevice` call
+on the way out. The message names the port (50815); find the python process
+holding it and kill it, because the relay latches are still its to clear.
 
 ### Stopping the server
 
@@ -104,10 +109,16 @@ Disconnected from dome hardware
 If the middle line is missing, the board was never released — treat the dome as
 possibly still driving and check it.
 
-A **second** SIGTERM kills the process outright: the first one restores the
-default handler on its way past. That is deliberate. Releasing the board can
-block inside the K8055 DLL, and an operator who has decided this process must
-die now needs a way to say so that does not depend on the DLL answering.
+A **second** Ctrl-C or SIGTERM kills the process outright: `main()`'s shutdown
+path restores the default handlers on its way in (and `_signal_shutdown`
+restores its own signal when it fires). That is deliberate. Releasing the board
+can block inside the K8055 DLL, where a Python-level handler cannot run at all
+— so without the reset, further Ctrl-Cs would be silently swallowed and the
+wedged process would keep the single-instance port, refusing every restart. The
+default handler acts below the interpreter and kills a wedged process too; the
+kill frees the port, so the next start comes up. The relays stay as the dead
+process left them until that next server's first client connects, whose
+initialisation stops both shells.
 
 Two gaps remain, both Windows-only and neither fixable in `signal`:
 

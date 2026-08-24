@@ -106,6 +106,9 @@ def test_second_instance_is_refused_before_it_touches_the_log(monkeypatch, capsy
     """The whole point of the ordering: an operator restarting while the old
     process is still alive must be told *that*, not handed a log-file error."""
     monkeypatch.setattr(app, '_instance_guard', None)
+    # No grace here: this test is about the refusal, not the waiting. The grace
+    # behaviour has its own tests in test_instance_guard.py.
+    monkeypatch.setattr(app, '_GUARD_GRACE_SECONDS', 0.0)
     incumbent = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     incumbent.bind(('127.0.0.1', app._SINGLE_INSTANCE_PORT))
     incumbent.listen(1)
