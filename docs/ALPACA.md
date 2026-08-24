@@ -342,6 +342,23 @@ layer inherited from the AlpycaDevice sample:
    connection on its own thread. Confirmed by contrast with the reference ASCOM
    Alpaca Simulators, which keeps the connection open.
 
+A third defect in the same inherited layer was found later, not by Conform but
+by building a second server on this one (`Greenhill-RainMon`, the weather
+devices) and watching a responder fail:
+
+3. **The uncaught-exception handler crashed instead of reporting.** falcon made
+   `HTTPInternalServerError`'s arguments keyword-only in 3.0, and the sample
+   passes them positionally — so `falcon_uncaught_exception_handler`, whose one
+   job is to turn a responder fault into a logged 500, raised a `TypeError` of
+   its own. The real exception was discarded and the `TypeError` escaped the
+   WSGI app rather than becoming a response. Fixed in `app.py`.
+
+   Nothing noticed because no test had ever made a responder fail; most of them
+   catch their own exceptions and answer with a `DriverException` in the Alpaca
+   envelope, so this path only opens for the members that do not. There is now
+   a regression test that breaks a responder deliberately and asserts both the
+   500 and that the original fault reaches the log.
+
 ## Commissioning checklist (on the real dome, from the maintainer)
 
 1. **Settle the reed/position question** above: does the board reset the

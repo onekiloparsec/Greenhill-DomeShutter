@@ -235,9 +235,15 @@ def falcon_uncaught_exception_handler(req: Request, resp: Response,
     """Log exceptions escaping a responder instead of losing them to stdout."""
     exc = sys.exc_info()
     custom_excepthook(exc[0], exc[1], exc[2])
+    # Keyword arguments, not positional. Falcon made these keyword-only in 3.0,
+    # and the AlpycaDevice sample this is taken from predates that -- so the
+    # handler whose whole job is to report a fault raised a TypeError of its
+    # own instead, discarding the real exception and escaping the WSGI app
+    # rather than returning a 500. The one thing it must never do is lose the
+    # error it was called to report.
     raise HTTPInternalServerError(
-        'Internal Server Error',
-        'Alpaca endpoint responder failed. See logfile.')
+        title='Internal Server Error',
+        description='Alpaca endpoint responder failed. See logfile.')
 
 
 def main():

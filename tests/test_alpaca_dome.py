@@ -289,3 +289,71 @@ def test_devicestate_returns_the_platform7_bulk_read(client):
     assert 'ShutterStatus' in values
     assert 'Slewing' in values
     assert 'TimeStamp' in values
+
+
+
+class TestUncaughtResponderException:
+    """What a client sees when a responder raises something nobody caught.
+
+    Most responders catch their own exceptions and answer with a
+    DriverException inside the Alpaca envelope. This covers the ones that do
+    not -- and, more to the point, the app-level handler that exists to catch
+    whatever they miss.
+
+    That handler used to raise a TypeError of its own: falcon made
+    HTTPInternalServerError's arguments keyword-only in 3.0, and the
+    AlpycaDevice sample it came from predates that. So the real fault was
+    discarded and a TypeError escaped the WSGI app instead of becoming a 500 --
+    the one thing a handler whose job is reporting errors must never do.
+    Nothing caught it because no test had ever made a responder fail.
+    """
+
+    @pytest.fixture
+    def broken_client(self, board):
+        import logging
+
+        import app as device_app
+        import dome as dome_module
+        import exceptions as device_exceptions
+        import log as device_log
+        import shr
+
+        quiet = logging.getLogger('greenhill-dome-tests')
+        quiet.addHandler(logging.NullHandler())
+        shr.set_shr_logger(quiet)
+        device_exceptions.logger = quiet
+        dome_module.logger = quiet
+        # custom_excepthook logs through this one, which main() normally sets.
+        device_log.logger = quiet
+
+        class BrokenDevice:
+            @property
+            def connected(self):
+                raise RuntimeError('simulated driver fault')
+
+        previous = dome_module.dome_dev
+        dome_module.dome_dev = BrokenDevice()
+
+        falc_app = falcon.App()
+        device_app.init_routes(falc_app, 'dome', dome_module)
+        falc_app.add_error_handler(
+            Exception, device_app.falcon_uncaught_exception_handler)
+        try:
+            yield testing.TestClient(falc_app)
+        finally:
+            dome_module.dome_dev = previous
+
+    def test_returns_500_rather_than_escaping_the_app(self, broken_client):
+        response = broken_client.simulate_get(
+            '/api/v1/dome/0/connected',
+            params={'ClientID': '1', 'ClientTransactionID': '1'})
+        assert response.status_code == 500
+
+    def test_the_real_fault_reaches_the_log(self, broken_client, caplog):
+        # The whole point of the handler. The 500 body deliberately says
+        # nothing about the cause, so if it is not logged it is simply gone.
+        with caplog.at_level('ERROR'):
+            broken_client.simulate_get(
+                '/api/v1/dome/0/connected',
+                params={'ClientID': '1', 'ClientTransactionID': '1'})
+        assert 'simulated driver fault' in caplog.text
