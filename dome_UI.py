@@ -40,9 +40,12 @@ class DomeWorker(QObject):
 
     @Slot(int)
     def west_goto(self, value):
-        self.west_status.emit(f"WEST SETPOINT {value}"
-        value = 100 - value  # backwards state - 100 is closed, 0 is open
-        self.dome.goto_w(value)
+        # OPERATOR CONVENTION (maintainer's choice): the local UI shows percent
+        # CLOSED -- slider at 100 = closed, 0 = open -- matching the original
+        # dome controller. The inversion lives HERE, at the UI boundary, and
+        # only here: Dome_Control and the Alpaca surface are percent OPEN.
+        self.west_status.emit(f"WEST SETPOINT {value}")
+        self.dome.goto_w(100 - value)
 
     @Slot()
     def east_open(self):
@@ -61,14 +64,23 @@ class DomeWorker(QObject):
 
     @Slot(int)
     def east_goto(self, value):
+        # percent closed in, percent open to the controller -- see west_goto
         self.east_status.emit(f"EAST SETPOINT {value}")
-        value = 100 - value  # backwards state - 100 is closed, 0 is open
-        self.dome.goto_e(value)
+        self.dome.goto_e(100 - value)
 
     @Slot()
     def dome_position(self):
-        self.east_position.emit(int(self.dome.last_east))
-        self.west_position.emit(int(self.dome.last_west))
+        # Progress bars show percent CLOSED (100 = fully closed), the operator
+        # convention, hence the inversion of the controller's percent open.
+        #
+        # display_percent derives from last_east/last_west rather than the live
+        # ADC reading: the pot jitters +/-1 count at rest, and the clamped
+        # monotonic last_* values are the maintainer's jitter-free solution
+        # (worst case: a ~1% jump on direction reversal). Previously this
+        # emitted raw analogue counts (0-235) into a 0-100 progress bar, so the
+        # display pegged at full past ~43% of travel.
+        self.east_position.emit(int(round(100 - self.dome.east_display_percent())))
+        self.west_position.emit(int(round(100 - self.dome.west_display_percent())))
 
 
 
@@ -137,8 +149,16 @@ class DomeWindow(QMainWindow):
         print("Toggling RDP Monitor")
 
     def closeEvent(self, event):
-        self.dome_thread.quit()
-        self.dome_thread.wait()
+        try:
+            self.dome_thread.quit()
+            # bounded: if the worker is stuck in a hung K8055 call, an untimed
+            # wait() would gate the de-energise on the very thing that failed
+            if not self.dome_thread.wait(3000):
+                print("Dome worker did not stop in 3 s; shutting down anyway")
+        finally:
+            # the K8055 latches its outputs in hardware: without this, closing
+            # the window leaves a running motor energised and unsupervised
+            self.dome.shutdown()
         super().closeEvent(event)
 
 if __name__ == "__main__":

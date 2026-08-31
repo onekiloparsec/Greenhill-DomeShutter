@@ -9,7 +9,12 @@ Dome Shutter.spec
 stop_monitor.flag
 stop_monitor.flag
 stop_monitor.flag
-/__pycache__
+__pycache__
 /.idea
 stop_monitor.flag
 Dome Shutter.py
+
+# Alpaca device server runtime artifacts
+alpyca.log*
+device/alpyca.log*
+.pytest_cache/

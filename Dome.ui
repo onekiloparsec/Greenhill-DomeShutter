@@ -298,6 +298,16 @@
       <height>171</height>
      </rect>
     </property>
+    <property name="styleSheet">
+     <string notr="true">QProgressBar {
+    border: 1px solid gray;
+    text-align: center;
+    font-size: 7pt;
+}
+QProgressBar::chunk {
+    background-color: #3c5a32;
+}</string>
+    </property>
     <property name="sizePolicy">
      <sizepolicy hsizetype="Maximum" vsizetype="Expanding">
       <horstretch>100</horstretch>
@@ -322,6 +332,16 @@
       <width>30</width>
       <height>171</height>
      </rect>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">QProgressBar {
+    border: 1px solid gray;
+    text-align: center;
+    font-size: 7pt;
+}
+QProgressBar::chunk {
+    background-color: #3c5a32;
+}</string>
     </property>
     <property name="sizePolicy">
      <sizepolicy hsizetype="Fixed" vsizetype="Expanding">
